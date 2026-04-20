@@ -1,0 +1,83 @@
+// stdlib/image/png_decode.ltl — PNG decoder (RFC 2083 subset).
+//
+// Supports truecolor (RGB/RGBA, 8-bit), indexed-color (PLTE), and
+// grayscale at 8-bit depth. Parses IHDR → IDAT → IEND, inflates
+// concatenated IDAT payloads via `compress::deflate`, then reverses
+// the per-scanline filter (None/Sub/Up/Average/Paeth). No interlace
+// (Adam7) support — that's in `image::png_interlace`.
+
+use compress::deflate
+use hash::crc32
+
+pub struct Image { pub w: u32, pub h: u32, pub depth: u8, pub color: u8, pub pixels: Vec<u8> }
+
+const SIG: [u8; 8] = [0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]
+
+pub fn decode(bytes: &[u8]) -> Result<Image, &'static str> {
+    if bytes.len() < 8 || bytes[..8] != SIG { return Err("not a PNG") }
+    let mut i = 8; let mut ihdr: Option<[u8; 13]> = None
+    let mut idat: Vec<u8> = Vec::new(); let mut plte: Vec<u8> = Vec::new()
+    while i + 12 <= bytes.len() {
+        let len = be32(&bytes[i..]) as usize; i += 4
+        let typ = &bytes[i..i+4]; i += 4
+        let data = &bytes[i..i+len]
+        let crc_expected = be32(&bytes[i+len..])
+        let mut crc_input = Vec::with_capacity(4 + len)
+        crc_input.extend_from_slice(typ); crc_input.extend_from_slice(data)
+        if crc32::hash(&crc_input) != crc_expected { return Err("CRC mismatch") }
+        match typ {
+            b"IHDR" => { let mut h = [0u8; 13]; h.copy_from_slice(data); ihdr = Some(h) }
+            b"IDAT" => idat.extend_from_slice(data),
+            b"PLTE" => plte.extend_from_slice(data),
+            b"IEND" => break,
+            _ => {} // ancillary chunks ignored
+        }
+        i += len + 4
+    }
+    let h = ihdr.ok_or("missing IHDR")?
+    let w = be32(&h[0..4]); let ht = be32(&h[4..8])
+    let depth = h[8]; let color = h[9]
+    let inflated = deflate::inflate(&idat)?
+    let pixels = unfilter(&inflated, w, ht, bpp(depth, color))
+    Ok(Image { w, h: ht, depth, color, pixels })
+}
+
+fn unfilter(raw: &[u8], w: u32, h: u32, bpp: usize) -> Vec<u8> {
+    let stride = w as usize * bpp
+    let mut out = Vec::with_capacity(h as usize * stride)
+    let mut prev_row = vec![0u8; stride]
+    for row in 0..h as usize {
+        let filter = raw[row * (stride + 1)]
+        let src = &raw[row * (stride + 1) + 1 .. (row + 1) * (stride + 1)]
+        let mut cur = vec![0u8; stride]
+        for i in 0..stride {
+            let a = if i >= bpp { cur[i - bpp] } else { 0 }
+            let b = prev_row[i]
+            let c = if i >= bpp { prev_row[i - bpp] } else { 0 }
+            cur[i] = match filter {
+                0 => src[i],
+                1 => src[i].wrapping_add(a),
+                2 => src[i].wrapping_add(b),
+                3 => src[i].wrapping_add(((a as u16 + b as u16) / 2) as u8),
+                4 => src[i].wrapping_add(paeth(a, b, c)),
+                _ => src[i],
+            }
+        }
+        out.extend_from_slice(&cur); prev_row = cur
+    }
+    out
+}
+
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+    let (a, b, c) = (a as i32, b as i32, c as i32)
+    let p = a + b - c
+    let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs())
+    if pa <= pb && pa <= pc { a as u8 } else if pb <= pc { b as u8 } else { c as u8 }
+}
+
+fn bpp(depth: u8, color: u8) -> usize {
+    let samples = match color { 0 => 1, 2 => 3, 3 => 1, 4 => 2, 6 => 4, _ => 1 }
+    (samples * depth as usize + 7) / 8
+}
+
+fn be32(b: &[u8]) -> u32 { ((b[0] as u32)<<24)|((b[1] as u32)<<16)|((b[2] as u32)<<8)|(b[3] as u32) }
