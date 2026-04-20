@@ -1,0 +1,50 @@
+// stdlib/hw/spi.ltl — SPI master, mode 0/1/2/3.
+//
+// CPOL/CPHA expressed as a single enum for clarity. Transactions are
+// full-duplex by nature; `transfer` returns the bytes shifted in while
+// `bytes_out` is shifted out, same length.
+
+use hw::hal::{Gpio, Clock}
+
+pub enum Mode { Mode0, Mode1, Mode2, Mode3 }
+
+pub struct Spi {
+    pub sck: Gpio, pub mosi: Gpio, pub miso: Gpio, pub cs: Option<Gpio>,
+    pub mode: Mode, pub bit_hz: u32, pub msb_first: bool,
+}
+
+impl Spi {
+    fn cpol(&self) -> bool { matches!(self.mode, Mode::Mode2 | Mode::Mode3) }
+    fn cpha(&self) -> bool { matches!(self.mode, Mode::Mode1 | Mode::Mode3) }
+
+    pub fn select(&mut self)   { if let Some(cs) = &mut self.cs { cs.set_low()  } }
+    pub fn deselect(&mut self) { if let Some(cs) = &mut self.cs { cs.set_high() } }
+
+    pub fn transfer(&mut self, out: &[u8]) -> Vec<u8> {
+        if self.cpol() { self.sck.set_high() } else { self.sck.set_low() }
+        let half_ns = 500_000_000u64 / self.bit_hz as u64
+        out.iter().map(|&b| self.byte(b, half_ns)).collect()
+    }
+    fn byte(&mut self, b: u8, half_ns: u64) -> u8 {
+        let order: Box<dyn Iterator<Item=u32>> = if self.msb_first {
+            Box::new((0..8).rev()) } else { Box::new(0..8) }
+        let mut rx = 0u8
+        for i in order {
+            let sample_first = !self.cpha()
+            if sample_first {
+                if (b >> i) & 1 == 1 { self.mosi.set_high() } else { self.mosi.set_low() }
+                Clock::delay_ns(half_ns); self.sck.toggle()
+                if self.miso.is_high() { rx |= 1 << i }
+                Clock::delay_ns(half_ns); self.sck.toggle()
+            } else {
+                self.sck.toggle(); Clock::delay_ns(half_ns)
+                if (b >> i) & 1 == 1 { self.mosi.set_high() } else { self.mosi.set_low() }
+                if self.miso.is_high() { rx |= 1 << i }
+                self.sck.toggle(); Clock::delay_ns(half_ns)
+            }
+        }
+        rx
+    }
+    pub fn write(&mut self, out: &[u8]) { let _ = self.transfer(out) }
+    pub fn read(&mut self, n: usize) -> Vec<u8> { self.transfer(&vec![0u8; n]) }
+}
