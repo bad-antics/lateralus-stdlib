@@ -1,0 +1,224 @@
+// http/client.ltl
+//
+// HTTP/1.1 client built on std::net::tcp and std::net::tls.
+// Pipeline-friendly: requests and responses are values, middleware
+// composes left-to-right with `|>`.
+//
+// Batch 77 / stdlib.
+
+import std::net::{tcp, tls}
+import std::collections::Map
+import std::io
+import std::time::Duration
+
+pub struct Request {
+    method:  String,
+    url:     Url,
+    headers: Map<String, String>,
+    body:    [Byte],
+    timeout: Duration,
+}
+
+pub struct Response {
+    status:  Int,
+    headers: Map<String, String>,
+    body:    [Byte],
+}
+
+pub struct Url {
+    scheme: String,     // "http" | "https"
+    host:   String,
+    port:   Int,
+    path:   String,     // includes query string
+}
+
+pub enum HttpError {
+    InvalidUrl(String),
+    Connect(String),
+    Tls(String),
+    Write(String),
+    Read(String),
+    MalformedResponse,
+    Timeout,
+}
+
+pub fn get(url: String) -> Result<Response, HttpError> {
+    request(Request {
+        method:  "GET",
+        url:     parse_url(url)?,
+        headers: default_headers(),
+        body:    [],
+        timeout: Duration::seconds(30),
+    })
+}
+
+pub fn post(url: String, body: [Byte], content_type: String)
+    -> Result<Response, HttpError>
+{
+    request(Request {
+        method:  "POST",
+        url:     parse_url(url)?,
+        headers: default_headers()
+                     |> set("content-type",  content_type)
+                     |> set("content-length", "{len(body)}"),
+        body:    body,
+        timeout: Duration::seconds(30),
+    })
+}
+
+pub fn request(req: Request) -> Result<Response, HttpError> {
+    let mut stream = open_stream(req.url, req.timeout)?
+    let wire       = render_request(req)
+    stream |> tcp::write_all(wire) |> map_err(|e| HttpError::Write(e))?
+    parse_response(&mut stream)
+}
+
+fn open_stream(url: Url, timeout: Duration) -> Result<Stream, HttpError> {
+    let raw = tcp::connect_with_timeout("{url.host}:{url.port}", timeout)
+        |> map_err(|e| HttpError::Connect(e))?
+    match url.scheme {
+        "http"  => Ok(Stream::Plain(raw)),
+        "https" => tls::wrap_client(raw, url.host)
+                       |> map(|s| Stream::Tls(s))
+                       |> map_err(|e| HttpError::Tls(e)),
+        other   => Err(HttpError::InvalidUrl("scheme: {other}")),
+    }
+}
+
+enum Stream {
+    Plain(tcp::Stream),
+    Tls(tls::Stream),
+}
+
+impl Stream {
+    fn write_all(self, bytes: [Byte]) -> Result<(), String> {
+        match self {
+            Stream::Plain(s) => s |> tcp::write_all(bytes),
+            Stream::Tls(s)   => s |> tls::write_all(bytes),
+        }
+    }
+    fn read_line(self) -> Result<String, String> {
+        match self {
+            Stream::Plain(s) => s |> tcp::read_line(),
+            Stream::Tls(s)   => s |> tls::read_line(),
+        }
+    }
+    fn read_exact(self, n: Int) -> Result<[Byte], String> {
+        match self {
+            Stream::Plain(s) => s |> tcp::read_exact(n),
+            Stream::Tls(s)   => s |> tls::read_exact(n),
+        }
+    }
+}
+
+fn render_request(r: Request) -> [Byte] {
+    let host_line = if r.url.port == default_port(r.url.scheme) {
+        r.url.host
+    } else {
+        "{r.url.host}:{r.url.port}"
+    }
+    let mut hdrs = r.headers |> set("host", host_line)
+    if not (hdrs |> contains_key("content-length")) && len(r.body) > 0 {
+        hdrs = hdrs |> set("content-length", "{len(r.body)}")
+    }
+    let head = [
+        "{r.method} {r.url.path} HTTP/1.1\r\n",
+        hdrs |> entries() |> map(|(k,v)| "{k}: {v}\r\n") |> join(""),
+        "\r\n",
+    ] |> join("")
+    [head |> as_bytes(), r.body] |> concat()
+}
+
+fn parse_response(s: &mut Stream) -> Result<Response, HttpError> {
+    let status_line = s |> Stream::read_line() |> map_err(|e| HttpError::Read(e))?
+    let status = status_line
+        |> split(" ")
+        |> get(1)
+        |> and_then(|s| s |> parse_int())
+        |> ok_or(HttpError::MalformedResponse)?
+
+    let mut headers: Map<String, String> = Map::empty()
+    loop {
+        let line = s |> Stream::read_line() |> map_err(|e| HttpError::Read(e))?
+        if line == "" || line == "\r" { break }
+        let (k, v) = line |> split_once(":") |> ok_or(HttpError::MalformedResponse)?
+        headers = headers |> set(k |> lower() |> trim(), v |> trim())
+    }
+
+    let body = match headers |> get("transfer-encoding") |> unwrap_or("") {
+        "chunked" => read_chunked(s)?,
+        _         => {
+            let n = headers |> get("content-length")
+                            |> and_then(|v| v |> parse_int())
+                            |> unwrap_or(0)
+            s |> Stream::read_exact(n) |> map_err(|e| HttpError::Read(e))?
+        },
+    }
+    Ok(Response { status, headers, body })
+}
+
+fn read_chunked(s: &mut Stream) -> Result<[Byte], HttpError> {
+    let mut out: [Byte] = []
+    loop {
+        let size_line = s |> Stream::read_line() |> map_err(|e| HttpError::Read(e))?
+        let size = size_line |> trim() |> parse_hex() |> unwrap_or(0)
+        if size == 0 {
+            let _ = s |> Stream::read_line()
+            return Ok(out)
+        }
+        let chunk = s |> Stream::read_exact(size) |> map_err(|e| HttpError::Read(e))?
+        out |> extend(chunk)
+        let _ = s |> Stream::read_line()   // trailing CRLF
+    }
+}
+
+fn parse_url(raw: String) -> Result<Url, HttpError> {
+    let (scheme, rest) = raw |> split_once("://")
+        |> ok_or(HttpError::InvalidUrl(raw))?
+    let (hostport, path) = match rest |> split_once("/") {
+        Some((h, p)) => (h, "/{p}"),
+        None         => (rest, "/"),
+    }
+    let (host, port) = match hostport |> split_once(":") {
+        Some((h, p)) => (h, p |> parse_int() |> unwrap_or(default_port(scheme))),
+        None         => (hostport, default_port(scheme)),
+    }
+    Ok(Url { scheme, host, port, path })
+}
+
+fn default_port(scheme: String) -> Int {
+    match scheme { "https" => 443, _ => 80 }
+}
+
+fn default_headers() -> Map<String, String> {
+    Map::empty()
+        |> set("user-agent", "lateralus-http/0.5")
+        |> set("accept", "*/*")
+        |> set("connection", "close")
+}
+
+// -- Middleware (pipeline-friendly) ----------------------------------------
+
+pub fn with_bearer(token: String, req: Request) -> Request {
+    Request { headers: req.headers |> set("authorization", "Bearer {token}"), ..req }
+}
+
+pub fn with_json_body(value: std::json::Value, req: Request) -> Request {
+    let body = value |> std::json::to_bytes()
+    Request {
+        body,
+        headers: req.headers |> set("content-type", "application/json"),
+        ..req
+    }
+}
+
+pub fn with_timeout(d: Duration, req: Request) -> Request {
+    Request { timeout: d, ..req }
+}
+
+// Usage:
+//   request(Request::new("POST", url))
+//       |> with_bearer(token)
+//       |> with_json_body(payload)
+//       |> with_timeout(Duration::seconds(5))
+//       |> send()?
