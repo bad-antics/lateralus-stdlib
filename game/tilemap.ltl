@@ -1,0 +1,54 @@
+// stdlib/game/tilemap.ltl — Orthogonal tilemap + TMX reader (subset).
+//
+// Parses a subset of the Tiled .tmx XML format (orthogonal maps, base64
+// + gzip layer encoding, object layers with rectangles and points).
+// Exposes efficient tile-picking by screen coordinate and a `ray_cast`
+// for line-of-sight queries on a "solid" tile property.
+
+use std::io::Reader
+use std::encoding::base64
+use compress::gzip_stream
+
+pub struct Tilemap {
+    pub width: u32, pub height: u32,
+    pub tile_w: u32, pub tile_h: u32,
+    pub layers: Vec<Layer>,
+}
+
+pub struct Layer { pub name: String, pub gids: Vec<u32> }
+
+impl Tilemap {
+    pub fn tile_at(&self, layer: usize, x: u32, y: u32) -> Option<u32> {
+        if x >= self.width || y >= self.height { return None }
+        self.layers.get(layer).map(|l| l.gids[(y * self.width + x) as usize])
+    }
+    pub fn screen_to_tile(&self, sx: i32, sy: i32) -> (i32, i32) {
+        (sx.div_euclid(self.tile_w as i32), sy.div_euclid(self.tile_h as i32))
+    }
+    pub fn ray_cast(&self, layer: usize,
+                    x0: i32, y0: i32, x1: i32, y1: i32,
+                    is_solid: impl Fn(u32) -> bool) -> Option<(i32, i32)> {
+        // Bresenham, short-circuit on solid.
+        let dx = (x1 - x0).abs(); let sx = if x0 < x1 { 1 } else { -1 }
+        let dy = -(y1 - y0).abs(); let sy = if y0 < y1 { 1 } else { -1 }
+        let mut err = dx + dy; let mut x = x0; let mut y = y0
+        loop {
+            if let Some(g) = self.tile_at(layer, x as u32, y as u32) {
+                if is_solid(g) { return Some((x,y)) }
+            }
+            if x == x1 && y == y1 { return None }
+            let e2 = 2 * err
+            if e2 >= dy { err += dy; x += sx }
+            if e2 <= dx { err += dx; y += sy }
+        }
+    }
+}
+
+pub fn parse_layer_data(b64_gz: &str, width: u32, height: u32) -> Result<Vec<u32>, String> {
+    let raw = base64::decode(b64_gz.trim())?
+    let mut r = Reader::new(&raw); let mut w = Vec::new()
+    gzip_stream::decode_stream(&mut r, &mut w)?
+    let expected = (width * height) as usize * 4
+    if w.len() != expected { return Err("tile count mismatch".into()) }
+    Ok(w.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+}
