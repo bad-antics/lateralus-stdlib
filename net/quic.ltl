@@ -1,0 +1,240 @@
+// stdlib/net/quic.ltl — QUIC transport protocol (RFC 9000) core.
+//
+// A minimal but correct QUIC packet parser and connection state
+// machine. Handles version negotiation, long-header and short-header
+// packets, variable-length integer encoding (VLQ), frame parsing,
+// and the four-tuple connection ID mapping.
+//
+// This is the foundation for HTTP/3 and several modern transport
+// use cases (WebTransport, MASQUE). It is intentionally missing TLS
+// 1.3 and congestion control — those live in separate modules.
+//
+// Scope: packet-level framing + connection lookup only.
+
+use crypto::rand::fill
+use std::io::{Bytes, Reader}
+
+pub const QUIC_VERSION_1: u32 = 0x0000_0001
+pub const QUIC_VERSION_NEG: u32 = 0x0000_0000
+
+// ── Variable-length integer (RFC 9000 §16) ─────────────────────
+
+pub fn varint_decode(r: &mut Reader) -> Result<u64, String> {
+    let first = r.read_u8()?
+    let prefix = first >> 6
+    let len = 1 << prefix          // 1, 2, 4, or 8 bytes
+    let mut v = (first & 0x3f) as u64
+    for _ in 1..len {
+        v = (v << 8) | (r.read_u8()? as u64)
+    }
+    Ok(v)
+}
+
+pub fn varint_encode(v: u64) -> Bytes {
+    match v {
+        0..=63                    => Bytes::from([v as u8]),
+        64..=16_383               => {
+            let b = (v | 0x4000).to_be_bytes()
+            Bytes::from(&b[6..8])
+        },
+        16_384..=1_073_741_823    => {
+            let b = (v | 0x8000_0000).to_be_bytes()
+            Bytes::from(&b[4..8])
+        },
+        _ => {
+            let b = (v | 0xc000_0000_0000_0000).to_be_bytes()
+            Bytes::from(&b[..])
+        },
+    }
+}
+
+// ── Packet types ──────────────────────────────────────────────
+
+pub enum PacketType {
+    Initial,
+    ZeroRtt,
+    Handshake,
+    Retry,
+    VersionNegotiation,
+    OneRtt,            // short header
+}
+
+pub struct LongHeader {
+    pub pkt_type:  PacketType,
+    pub version:   u32,
+    pub dst_cid:   Bytes,         // 0..20 bytes
+    pub src_cid:   Bytes,
+    pub token:     Bytes,         // Initial only
+    pub pkt_num:   u64,
+    pub payload:   Bytes,
+}
+
+pub struct ShortHeader {
+    pub dst_cid:   Bytes,         // length known from connection state
+    pub pkt_num:   u64,
+    pub payload:   Bytes,
+    pub key_phase: bool,
+    pub spin:      bool,
+}
+
+pub enum Header {
+    Long(LongHeader),
+    Short(ShortHeader),
+}
+
+pub fn parse_header(buf: &Bytes, local_cid_len: usize) -> Result<Header, String> {
+    let mut r = Reader::new(buf)
+    let first = r.read_u8()?
+    if (first & 0x80) != 0 {
+        let version = r.read_u32_be()?
+        if version == QUIC_VERSION_NEG {
+            return Ok(Header::Long(LongHeader {
+                pkt_type: PacketType::VersionNegotiation,
+                version, dst_cid: Bytes::empty(), src_cid: Bytes::empty(),
+                token: Bytes::empty(), pkt_num: 0, payload: r.remaining(),
+            }))
+        }
+        let dcil = r.read_u8()? as usize
+        let dst_cid = r.read_bytes(dcil)?
+        let scil = r.read_u8()? as usize
+        let src_cid = r.read_bytes(scil)?
+        let t = match (first >> 4) & 0x03 {
+            0 => PacketType::Initial,
+            1 => PacketType::ZeroRtt,
+            2 => PacketType::Handshake,
+            3 => PacketType::Retry,
+            _ => unreachable!(),
+        }
+        let token = match t {
+            PacketType::Initial => {
+                let tl = varint_decode(&mut r)? as usize
+                r.read_bytes(tl)?
+            },
+            _ => Bytes::empty(),
+        }
+        let length = varint_decode(&mut r)? as usize
+        let payload = r.read_bytes(length)?
+        Ok(Header::Long(LongHeader {
+            pkt_type: t, version, dst_cid, src_cid, token,
+            pkt_num: 0,      // decrypted separately
+            payload,
+        }))
+    } else {
+        let dst_cid = r.read_bytes(local_cid_len)?
+        Ok(Header::Short(ShortHeader {
+            dst_cid,
+            pkt_num: 0,
+            payload: r.remaining(),
+            key_phase: (first & 0x04) != 0,
+            spin:      (first & 0x20) != 0,
+        }))
+    }
+}
+
+// ── Frames (subset) ───────────────────────────────────────────
+
+pub enum Frame {
+    Padding,
+    Ping,
+    Ack { largest: u64, delay: u64, ranges: Vec<(u64,u64)> },
+    ResetStream  { id: u64, error: u64, final_size: u64 },
+    StopSending  { id: u64, error: u64 },
+    Crypto       { offset: u64, data: Bytes },
+    NewToken     { token: Bytes },
+    Stream       { id: u64, offset: u64, data: Bytes, fin: bool },
+    ConnectionClose { error: u64, frame_type: u64, reason: String },
+    HandshakeDone,
+}
+
+pub fn parse_frame(r: &mut Reader) -> Result<Frame, String> {
+    let t = varint_decode(r)?
+    match t {
+        0x00 => Ok(Frame::Padding),
+        0x01 => Ok(Frame::Ping),
+        0x02 | 0x03 => {
+            let largest = varint_decode(r)?
+            let delay = varint_decode(r)?
+            let range_count = varint_decode(r)? as usize
+            let first_range = varint_decode(r)?
+            let mut ranges = vec![(largest - first_range, largest)]
+            let mut smallest = largest - first_range
+            for _ in 0..range_count {
+                let gap = varint_decode(r)?
+                let len = varint_decode(r)?
+                let high = smallest - gap - 2
+                let low  = high - len
+                ranges.push((low, high))
+                smallest = low
+            }
+            Ok(Frame::Ack { largest, delay, ranges })
+        },
+        0x06 => Ok(Frame::Crypto {
+            offset: varint_decode(r)?,
+            data: {
+                let n = varint_decode(r)? as usize
+                r.read_bytes(n)?
+            },
+        }),
+        0x08..=0x0f => {
+            let has_off = (t & 0x04) != 0
+            let has_len = (t & 0x02) != 0
+            let fin     = (t & 0x01) != 0
+            let id = varint_decode(r)?
+            let offset = if has_off { varint_decode(r)? } else { 0 }
+            let data = if has_len {
+                let n = varint_decode(r)? as usize
+                r.read_bytes(n)?
+            } else { r.remaining() }
+            Ok(Frame::Stream { id, offset, data, fin })
+        },
+        0x1c | 0x1d => Ok(Frame::ConnectionClose {
+            error: varint_decode(r)?,
+            frame_type: if t == 0x1c { varint_decode(r)? } else { 0 },
+            reason: {
+                let n = varint_decode(r)? as usize
+                String::from_utf8(r.read_bytes(n)?.to_vec())?
+            },
+        }),
+        0x1e => Ok(Frame::HandshakeDone),
+        _    => Err(format!("unknown frame type 0x{t:02x}")),
+    }
+}
+
+// ── Connection ID table ───────────────────────────────────────
+
+pub struct Endpoint {
+    pub conns: Map<Bytes, ConnId>,   // dst_cid → connection handle
+    pub cid_len: usize,              // usually 8
+}
+
+pub type ConnId = u64
+
+impl Endpoint {
+    pub fn new(cid_len: usize) -> Self {
+        Self { conns: Map::new(), cid_len }
+    }
+
+    pub fn issue_cid(&mut self, conn: ConnId) -> Bytes {
+        let mut cid = vec![0u8; self.cid_len]
+        crypto::rand::fill(&mut cid)
+        self.conns.insert(cid.clone().into(), conn)
+        cid.into()
+    }
+
+    pub fn lookup(&self, cid: &Bytes) -> Option<ConnId> {
+        self.conns.get(cid).copied()
+    }
+
+    pub fn retire(&mut self, cid: &Bytes) {
+        self.conns.remove(cid)
+    }
+}
+
+#[test]
+fn varint_roundtrip() {
+    for &v in &[0u64, 37, 15293, 494_878_333, 151_288_809_941_952_652] {
+        let enc = varint_encode(v)
+        let mut r = Reader::new(&enc)
+        assert_eq!(varint_decode(&mut r).unwrap(), v)
+    }
+}
