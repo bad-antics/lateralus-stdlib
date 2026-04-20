@@ -1,0 +1,53 @@
+// stdlib/text/bloom.ltl — Bloom filter sized from false-positive rate.
+//
+// Given expected element count n and desired false-positive rate p,
+// compute the optimal bit-array size m and hash count k:
+//     m = -n·ln(p) / (ln 2)²
+//     k = (m/n) · ln 2
+// Double-hashing gives us k hashes from two independent 64-bit hashes.
+
+use hash::xxhash64
+use std::math::ln
+
+pub struct Bloom { bits: Vec<u64>, bit_count: u64, hashes: u32 }
+
+impl Bloom {
+    pub fn new(expected: u64, fp_rate: f64) -> Self {
+        let m = (-(expected as f64) * ln(fp_rate) / (ln(2.0) * ln(2.0))).ceil() as u64
+        let k = ((m as f64 / expected as f64) * ln(2.0)).round().max(1.0) as u32
+        let words = (m + 63) / 64
+        Self { bits: vec![0; words as usize], bit_count: words * 64, hashes: k }
+    }
+    pub fn insert(&mut self, item: &[u8]) {
+        let (h1, h2) = two_hashes(item)
+        for i in 0..self.hashes {
+            let bit = (h1.wrapping_add((i as u64).wrapping_mul(h2))) % self.bit_count
+            self.bits[(bit / 64) as usize] |= 1u64 << (bit % 64)
+        }
+    }
+    pub fn contains(&self, item: &[u8]) -> bool {
+        let (h1, h2) = two_hashes(item)
+        for i in 0..self.hashes {
+            let bit = (h1.wrapping_add((i as u64).wrapping_mul(h2))) % self.bit_count
+            if self.bits[(bit / 64) as usize] & (1u64 << (bit % 64)) == 0 { return false }
+        }
+        true
+    }
+    pub fn estimated_count(&self) -> u64 {
+        let set_bits: u32 = self.bits.iter().map(|w| w.count_ones()).sum()
+        let m = self.bit_count as f64
+        let k = self.hashes as f64
+        (-m / k * (1.0 - set_bits as f64 / m).ln()) as u64
+    }
+    pub fn union_in_place(&mut self, other: &Bloom) -> Result<(), &'static str> {
+        if self.bit_count != other.bit_count || self.hashes != other.hashes {
+            return Err("bloom size/hash mismatch")
+        }
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) { *a |= *b }
+        Ok(())
+    }
+}
+
+fn two_hashes(item: &[u8]) -> (u64, u64) {
+    (xxhash64::hash_with_seed(item, 0), xxhash64::hash_with_seed(item, 0x9E3779B97F4A7C15))
+}
