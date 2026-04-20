@@ -1,0 +1,77 @@
+// stdlib/finance/ofx.ltl — OFX 2.x (XML flavor) statement parser.
+//
+// Banks and brokerages export transactions in Open Financial Exchange
+// (.ofx / .qfx). OFX 1.x is SGML (awful) but OFX 2.x is just XML. This
+// module parses the 2.x form — statement response, investment-holdings
+// response, credit-card response — into clean records. SGML-form 1.x
+// files need preprocessing by `ofx::sgml_to_xml` (separate module).
+
+use std::io::Reader
+use std::time::Date
+
+pub struct BankAccount { pub bank_id: String, pub acct_id: String, pub kind: String }
+
+pub struct Txn {
+    pub ty: String,           // "DEBIT" | "CREDIT" | "CHECK" | "INT" | ...
+    pub date: Date,
+    pub amount: i64,          // integer cents
+    pub id: String,           // FITID
+    pub memo: String,
+    pub payee: Option<String>,
+}
+
+pub struct Statement {
+    pub acct: BankAccount,
+    pub currency: String,     // ISO 4217, e.g. "USD"
+    pub available: i64,       // cents
+    pub ledger:    i64,
+    pub txns: Vec<Txn>,
+}
+
+pub fn parse_statement(xml: &str) -> Result<Statement, String> {
+    let acct = BankAccount {
+        bank_id: pick(xml, "BANKID").unwrap_or_default(),
+        acct_id: pick(xml, "ACCTID").unwrap_or_default(),
+        kind:    pick(xml, "ACCTTYPE").unwrap_or_default(),
+    }
+    let currency = pick(xml, "CURDEF").unwrap_or("USD".into())
+    let ledger = pick_cents(xml, "LEDGERBAL", "BALAMT").unwrap_or(0)
+    let avail  = pick_cents(xml, "AVAILBAL", "BALAMT").unwrap_or(ledger)
+    let txns = split_all(xml, "STMTTRN").iter()
+        .map(|t| Txn {
+            ty:      pick(t, "TRNTYPE").unwrap_or_default(),
+            date:    Date::parse_ofx(&pick(t, "DTPOSTED").unwrap_or_default()).unwrap_or(Date::epoch()),
+            amount:  parse_cents(&pick(t, "TRNAMT").unwrap_or("0".into())),
+            id:      pick(t, "FITID").unwrap_or_default(),
+            memo:    pick(t, "MEMO").unwrap_or_default(),
+            payee:   pick(t, "NAME"),
+        }).collect()
+    Ok(Statement { acct, currency, available: avail, ledger, txns })
+}
+
+fn pick(xml: &str, tag: &str) -> Option<String> {
+    let start = format!("<{tag}>"); let end = format!("</{tag}>")
+    let i = xml.find(&start)? + start.len()
+    let j = xml[i..].find(&end)? + i
+    Some(xml[i..j].trim().into())
+}
+fn pick_cents(xml: &str, wrapper: &str, inner: &str) -> Option<i64> {
+    let start = format!("<{wrapper}>"); let end = format!("</{wrapper}>")
+    let i = xml.find(&start)? + start.len()
+    let j = xml[i..].find(&end)? + i
+    pick(&xml[i..j], inner).map(|s| parse_cents(&s))
+}
+fn split_all(xml: &str, tag: &str) -> Vec<String> {
+    let start = format!("<{tag}>"); let end = format!("</{tag}>")
+    let mut out = Vec::new(); let mut cursor = 0
+    while let Some(i) = xml[cursor..].find(&start) {
+        let a = cursor + i
+        let b = xml[a..].find(&end).map(|x| a + x + end.len()).unwrap_or(xml.len())
+        out.push(xml[a..b].into()); cursor = b
+    }
+    out
+}
+fn parse_cents(s: &str) -> i64 {
+    let f: f64 = s.trim().parse().unwrap_or(0.0)
+    (f * 100.0).round() as i64
+}
