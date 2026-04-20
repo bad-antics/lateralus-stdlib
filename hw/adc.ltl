@@ -1,0 +1,53 @@
+// stdlib/hw/adc.ltl — ADC sampler with oversampling + median filter.
+//
+// Most cheap ADCs (10-12 bit) are noisy enough that reading one value
+// per measurement is hobbyist. This wraps a HAL channel and offers
+// three standard denoising strategies:
+//
+//  - oversample(n): sum n samples, return (sum / n) with accumulator
+//    width widened to prevent overflow on 32-bit ADCs.
+//  - median(n):     take n samples, return the middle; excellent
+//    against spikes from switching loads.
+//  - ema(alpha):    exponential moving average for continuous reads.
+
+use hw::hal::AdcChan
+
+pub struct Adc {
+    pub ch: AdcChan,
+    pub bits: u8,          // 8..16
+    pub vref_mv: u32,      // reference voltage in millivolts
+    ema: u32,
+}
+
+impl Adc {
+    pub fn new(ch: AdcChan, bits: u8, vref_mv: u32) -> Self {
+        Self { ch, bits, vref_mv, ema: 0 }
+    }
+    pub fn raw(&mut self) -> u32 { self.ch.sample() as u32 }
+    pub fn millivolts(&mut self) -> u32 {
+        let r = self.raw()
+        (r * self.vref_mv) >> self.bits
+    }
+    pub fn oversample(&mut self, n: u32) -> u32 {
+        let mut sum = 0u64
+        for _ in 0..n { sum += self.raw() as u64 }
+        (sum / n as u64) as u32
+    }
+    pub fn median(&mut self, n: usize) -> u32 {
+        let mut buf: Vec<u32> = (0..n).map(|_| self.raw()).collect()
+        buf.sort()
+        buf[n / 2]
+    }
+    pub fn ema(&mut self, alpha_q16: u32) -> u32 {
+        let s = self.raw()
+        self.ema = ((alpha_q16 * s) + ((65536 - alpha_q16) * self.ema)) >> 16
+        self.ema
+    }
+    pub fn thermistor_c(&mut self, r_pullup: f32, r25: f32, beta: f32) -> f32 {
+        let mv = self.millivolts() as f32
+        let vr = mv / self.vref_mv as f32
+        let r  = r_pullup * vr / (1.0 - vr)
+        let t_inv = 1.0 / 298.15 + (1.0 / beta) * (r / r25).ln()
+        1.0 / t_inv - 273.15
+    }
+}
