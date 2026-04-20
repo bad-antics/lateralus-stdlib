@@ -1,0 +1,60 @@
+// stdlib/audio/ogg_page.ltl — Ogg page (container) parser.
+//
+// Ogg wraps packetized codec data (Vorbis, Opus, FLAC, Speex) in pages
+// with a 27-byte header plus a segment table. Each page carries up to
+// 255 segments, each ≤255 bytes; a packet can span multiple pages via
+// "continued" flag in header byte 5.
+
+pub const CAPTURE_PATTERN: [u8; 4] = *b"OggS"
+
+pub struct Page<'a> {
+    pub version: u8,
+    pub header_flags: u8,      // bit 0: continued, 1: first, 2: last
+    pub granule_position: u64,
+    pub bitstream_serial: u32,
+    pub page_seq: u32,
+    pub checksum: u32,
+    pub segments: Vec<&'a [u8]>,  // reassembled packets within the page
+}
+
+pub fn parse(bytes: &[u8]) -> Result<(Page, usize), &'static str> {
+    if bytes.len() < 27 || bytes[..4] != CAPTURE_PATTERN { return Err("no OggS capture") }
+    let version = bytes[4]
+    let flags = bytes[5]
+    let granule = le64(&bytes[6..])
+    let serial = le32(&bytes[14..])
+    let seq = le32(&bytes[18..])
+    let crc = le32(&bytes[22..])
+    let n_segs = bytes[26] as usize
+    let seg_table = &bytes[27..27 + n_segs]
+    let mut i = 27 + n_segs
+    let mut packets: Vec<&[u8]> = Vec::new()
+    let mut pkt_start = i
+    for &sz in seg_table {
+        i += sz as usize
+        if sz < 255 { packets.push(&bytes[pkt_start..i]); pkt_start = i }
+    }
+    // A trailing 255-byte segment means the packet continues into the next page.
+    if pkt_start < i { packets.push(&bytes[pkt_start..i]) }
+    Ok((Page { version, header_flags: flags, granule_position: granule,
+        bitstream_serial: serial, page_seq: seq, checksum: crc, segments: packets }, i))
+}
+
+pub fn iter_pages(bytes: &[u8]) -> PageIter { PageIter { buf: bytes, off: 0 } }
+pub struct PageIter<'a> { buf: &'a [u8], off: usize }
+impl<'a> Iterator for PageIter<'a> {
+    type Item = Page<'a>
+    fn next(&mut self) -> Option<Page<'a>> {
+        if self.off >= self.buf.len() { return None }
+        let (page, n) = parse(&self.buf[self.off..]).ok()?
+        self.off += n
+        Some(page)
+    }
+}
+
+fn le32(b: &[u8]) -> u32 { (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24) }
+fn le64(b: &[u8]) -> u64 {
+    let mut v = 0u64
+    for i in 0..8 { v |= (b[i] as u64) << (i * 8) }
+    v
+}
