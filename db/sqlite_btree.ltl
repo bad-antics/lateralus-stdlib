@@ -1,0 +1,244 @@
+// db/sqlite_btree.ltl
+//
+// Read-only SQLite 3 B-tree page walker.
+//
+// The SQLite file format is stable, documented, and everywhere: every
+// iOS and Android app, Firefox history, Dropbox client, and thousands
+// of embedded systems store data in a `.sqlite` file. This module
+// exposes the *physical* structure — the 100-byte file header, the
+// freelist, and the B-tree pages — without touching the SQL layer.
+//
+// Use cases: forensics, corruption recovery, schema archaeology,
+// storage debugging. A SQL interpreter on top is a different module.
+//
+// Batch 80 / storage / forensics niche. First SQLite reader in the ecosystem.
+
+import std::bin
+import std::io
+import std::collections::List
+
+pub const PAGE_SIZE_MIN: Int = 512
+pub const PAGE_SIZE_MAX: Int = 65536
+pub const HEADER_MAGIC: String = "SQLite format 3\0"
+
+pub struct FileHeader {
+    page_size:            Int,
+    write_version:        Int,
+    read_version:         Int,
+    reserved_space:       Int,
+    max_embedded_frac:    Int,         // always 64
+    min_embedded_frac:    Int,         // always 32
+    leaf_frac:            Int,         // always 32
+    change_counter:       Int,
+    page_count:           Int,
+    first_freelist_page:  Int,
+    freelist_page_count:  Int,
+    schema_cookie:        Int,
+    text_encoding:        TextEncoding,
+    application_id:       Int,
+    user_version:         Int,
+}
+
+pub enum TextEncoding { Utf8, Utf16Le, Utf16Be, Unknown(Int) }
+
+pub enum PageKind {
+    InteriorIndex,      // 0x02
+    InteriorTable,      // 0x05
+    LeafIndex,          // 0x0A
+    LeafTable,          // 0x0D
+    Overflow,
+    Freelist,
+    FreelistTrunk,
+}
+
+pub struct Page {
+    number:   Int,              // 1-based
+    kind:     PageKind,
+    raw:      [Byte],
+    header:   PageHeader,
+    cells:    [Cell],           // empty for overflow/freelist
+}
+
+pub struct PageHeader {
+    first_freeblock:  Int,
+    cell_count:       Int,
+    cell_content_off: Int,
+    frag_bytes:       Int,
+    right_pointer:    Option<Int>,    // interior only
+}
+
+pub struct Cell {
+    offset:    Int,
+    rowid:     Option<Int>,           // table cells
+    payload:   [Byte],
+    overflow:  Option<Int>,           // first overflow page, 0 = none
+    left_child: Option<Int>,          // interior only
+}
+
+pub enum ReadError {
+    BadMagic,
+    ShortRead(Int),
+    BadPageKind(Byte),
+    Io(String),
+}
+
+// -- File header ------------------------------------------------------------
+
+pub fn read_file_header(bytes: [Byte]) -> Result<FileHeader, ReadError> {
+    if len(bytes) < 100 { return Err(ReadError::ShortRead(len(bytes))) }
+    let magic = bytes[0..16] |> String::from_bytes()
+    if magic != HEADER_MAGIC { return Err(ReadError::BadMagic) }
+
+    let ps_raw = ((bytes[16] as Int) << 8) | (bytes[17] as Int)
+    let page_size = if ps_raw == 1 { 65536 } else { ps_raw }
+
+    Ok(FileHeader {
+        page_size,
+        write_version:       bytes[18] as Int,
+        read_version:        bytes[19] as Int,
+        reserved_space:      bytes[20] as Int,
+        max_embedded_frac:   bytes[21] as Int,
+        min_embedded_frac:   bytes[22] as Int,
+        leaf_frac:           bytes[23] as Int,
+        change_counter:      bin::read_be_u32(bytes[24..28]),
+        page_count:          bin::read_be_u32(bytes[28..32]),
+        first_freelist_page: bin::read_be_u32(bytes[32..36]),
+        freelist_page_count: bin::read_be_u32(bytes[36..40]),
+        schema_cookie:       bin::read_be_u32(bytes[40..44]),
+        text_encoding:       match bin::read_be_u32(bytes[56..60]) {
+            1 => TextEncoding::Utf8,
+            2 => TextEncoding::Utf16Le,
+            3 => TextEncoding::Utf16Be,
+            n => TextEncoding::Unknown(n),
+        },
+        user_version:        bin::read_be_u32(bytes[60..64]),
+        application_id:      bin::read_be_u32(bytes[68..72]),
+    })
+}
+
+// -- Page decode ------------------------------------------------------------
+
+pub fn read_page(file_bytes: [Byte], page_no: Int, header: FileHeader)
+                 -> Result<Page, ReadError> {
+    let off = (page_no - 1) * header.page_size
+    if off + header.page_size > len(file_bytes) {
+        return Err(ReadError::ShortRead(len(file_bytes)))
+    }
+    let raw = file_bytes[off..(off + header.page_size)]
+
+    // Page 1 embeds the 100-byte file header before the B-tree header.
+    let bth_off = if page_no == 1 { 100 } else { 0 }
+
+    let kind = match raw[bth_off] {
+        0x02 => PageKind::InteriorIndex,
+        0x05 => PageKind::InteriorTable,
+        0x0A => PageKind::LeafIndex,
+        0x0D => PageKind::LeafTable,
+        b    => return Err(ReadError::BadPageKind(b)),
+    }
+    let is_interior = matches!(kind, PageKind::InteriorIndex | PageKind::InteriorTable)
+
+    let header = PageHeader {
+        first_freeblock:  bin::read_be_u16(raw[(bth_off+1)..(bth_off+3)]),
+        cell_count:       bin::read_be_u16(raw[(bth_off+3)..(bth_off+5)]),
+        cell_content_off: {
+            let v = bin::read_be_u16(raw[(bth_off+5)..(bth_off+7)])
+            if v == 0 { 65536 } else { v }
+        },
+        frag_bytes:       raw[bth_off + 7] as Int,
+        right_pointer:    if is_interior {
+            Some(bin::read_be_u32(raw[(bth_off+8)..(bth_off+12)]))
+        } else { None },
+    }
+
+    let pointers_off = bth_off + (if is_interior { 12 } else { 8 })
+    let mut cells: [Cell] = []
+    for i in 0..header.cell_count {
+        let ptr = bin::read_be_u16(raw[(pointers_off + i*2)..(pointers_off + i*2 + 2)])
+        cells |> push_mut(decode_cell(raw, ptr, kind))
+    }
+
+    Ok(Page { number: page_no, kind, raw, header, cells })
+}
+
+fn decode_cell(raw: [Byte], off: Int, kind: PageKind) -> Cell {
+    let mut pos = off
+    let mut c = Cell { offset: off, rowid: None, payload: [], overflow: None, left_child: None }
+    match kind {
+        PageKind::InteriorTable => {
+            c.left_child = Some(bin::read_be_u32(raw[pos..(pos+4)]))
+            pos = pos + 4
+            let (rowid, adv) = read_varint(raw, pos)
+            c.rowid = Some(rowid)
+        },
+        PageKind::InteriorIndex => {
+            c.left_child = Some(bin::read_be_u32(raw[pos..(pos+4)]))
+            pos = pos + 4
+            let (plen, adv) = read_varint(raw, pos)
+            pos = pos + adv
+            c.payload = raw[pos..(pos + plen)]
+        },
+        PageKind::LeafTable => {
+            let (plen, adv1) = read_varint(raw, pos)
+            pos = pos + adv1
+            let (rowid, adv2) = read_varint(raw, pos)
+            pos = pos + adv2
+            c.rowid = Some(rowid)
+            c.payload = raw[pos..(pos + plen)]
+        },
+        PageKind::LeafIndex => {
+            let (plen, adv) = read_varint(raw, pos)
+            pos = pos + adv
+            c.payload = raw[pos..(pos + plen)]
+        },
+        _ => (),
+    }
+    c
+}
+
+/// SQLite varint: 1..9 big-endian bytes, high bit set except the last.
+pub fn read_varint(bs: [Byte], off: Int) -> (Int, Int) {
+    let mut v: Int = 0
+    let mut i: Int = 0
+    while i < 8 {
+        let b = bs[off + i] as Int
+        v = (v << 7) | (b & 0x7F)
+        i = i + 1
+        if (b & 0x80) == 0 { return (v, i) }
+    }
+    v = (v << 8) | (bs[off + 8] as Int)
+    (v, 9)
+}
+
+/// Walk every table B-tree rooted at `root_page`, yielding each leaf cell's payload.
+pub fn walk_table(file_bytes: [Byte], root_page: Int, header: FileHeader)
+                  -> impl Iterator<(Int, [Byte])> {
+    let mut stack: [Int] = [root_page]
+    Iterator::from_fn(|| {
+        while len(stack) > 0 {
+            let n = stack |> pop_mut() |> unwrap()
+            let p = match read_page(file_bytes, n, header) {
+                Ok(p) => p, Err(_) => continue,
+            }
+            match p.kind {
+                PageKind::LeafTable => {
+                    for c in p.cells {
+                        match c.rowid {
+                            Some(r) => return Some((r, c.payload)),
+                            None    => (),
+                        }
+                    }
+                },
+                PageKind::InteriorTable => {
+                    // Push children in reverse so left is visited first.
+                    for c in p.cells |> reverse() {
+                        match c.left_child { Some(lc) => stack |> push_mut(lc), None => () }
+                    }
+                    match p.header.right_pointer { Some(rp) => stack |> push_mut(rp), None => () }
+                },
+                _ => (),
+            }
+        }
+        None
+    })
+}
