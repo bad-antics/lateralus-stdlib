@@ -1,0 +1,62 @@
+// stdlib/audio/adpcm_ima.ltl — IMA ADPCM codec (4:1 compression).
+//
+// The Interactive Multimedia Association's 4-bit differential encoder
+// from the early '90s. Each 4-bit nibble encodes the delta-to-predictor
+// and simultaneously updates the step-size index. State is just two
+// fields: the signed 16-bit predictor and a 0..88 index into the step
+// table. Famously ships in countless game audio banks (WAV fmt tag 17,
+// iff/aiff chunks, Sega Genesis/GBA ROMs) because of its trivial decode.
+
+const STEP: [i16; 89] = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+    34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+    157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544,
+    598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707,
+    1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871,
+    5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635,
+    13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767]
+
+const INDEX_ADJ: [i8; 16] = [-1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8]
+
+pub struct State { pub predictor: i16, pub index: u8 }
+
+pub fn decode_nibble(st: &mut State, n: u8) -> i16 {
+    let step = STEP[st.index as usize] as i32
+    let mut diff = step >> 3
+    if n & 4 != 0 { diff += step }
+    if n & 2 != 0 { diff += step >> 1 }
+    if n & 1 != 0 { diff += step >> 2 }
+    let pred = st.predictor as i32
+    let pred = if n & 8 != 0 { pred - diff } else { pred + diff }
+    st.predictor = pred.clamp(-32768, 32767) as i16
+    let idx = (st.index as i8) + INDEX_ADJ[n as usize]
+    st.index = idx.clamp(0, 88) as u8
+    st.predictor
+}
+
+pub fn decode_block(state: &mut State, nibbles: &[u8]) -> Vec<i16> {
+    let mut out = Vec::with_capacity(nibbles.len() * 2)
+    for &byte in nibbles {
+        out.push(decode_nibble(state, byte & 0x0F))
+        out.push(decode_nibble(state, byte >> 4))
+    }
+    out
+}
+
+pub fn encode_nibble(st: &mut State, sample: i16) -> u8 {
+    let step = STEP[st.index as usize] as i32
+    let mut diff = (sample as i32) - (st.predictor as i32)
+    let mut n = 0u8
+    if diff < 0 { n = 8; diff = -diff }
+    let mut delta = step >> 3
+    if diff >= step { n |= 4; diff -= step; delta += step }
+    if diff >= step >> 1 { n |= 2; diff -= step >> 1; delta += step >> 1 }
+    if diff >= step >> 2 { n |= 1;                    delta += step >> 2 }
+    // Update predictor identically to decode so encoder & decoder drift together.
+    let pred = st.predictor as i32
+    let pred = if n & 8 != 0 { pred - delta } else { pred + delta }
+    st.predictor = pred.clamp(-32768, 32767) as i16
+    let idx = (st.index as i8) + INDEX_ADJ[n as usize]
+    st.index = idx.clamp(0, 88) as u8
+    n
+}
