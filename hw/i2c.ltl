@@ -1,0 +1,65 @@
+// stdlib/hw/i2c.ltl — I²C master-mode driver abstraction.
+//
+// Bit-level timing lives in a platform HAL crate; this module presents
+// the wire-format state machine (start, repeated-start, ack/nack, stop)
+// and the two transactions nearly every I²C chip uses: register-read
+// and register-write. Targets any HAL that exposes open-drain GPIO.
+
+use hw::hal::{Gpio, Clock}
+
+pub struct I2C { pub sda: Gpio, pub scl: Gpio, pub freq_hz: u32 }
+
+pub enum I2cErr { Nack, ArbLost, BusBusy, Timeout }
+
+impl I2C {
+    pub fn write_reg(&mut self, addr: u8, reg: u8, val: u8) -> Result<(), I2cErr> {
+        self.start()?
+        self.tx_byte(addr << 1)?      // W
+        self.tx_byte(reg)?
+        self.tx_byte(val)?
+        self.stop(); Ok(())
+    }
+    pub fn read_reg(&mut self, addr: u8, reg: u8) -> Result<u8, I2cErr> {
+        self.start()?
+        self.tx_byte(addr << 1)?
+        self.tx_byte(reg)?
+        self.start()?                  // repeated start
+        self.tx_byte((addr << 1) | 1)? // R
+        let v = self.rx_byte(false)?   // NACK to end
+        self.stop(); Ok(v)
+    }
+    pub fn read_block(&mut self, addr: u8, reg: u8, out: &mut [u8]) -> Result<(), I2cErr> {
+        self.start()?
+        self.tx_byte(addr << 1)?
+        self.tx_byte(reg)?
+        self.start()?
+        self.tx_byte((addr << 1) | 1)?
+        for i in 0..out.len() {
+            out[i] = self.rx_byte(i + 1 < out.len())?
+        }
+        self.stop(); Ok(())
+    }
+
+    fn start(&mut self) -> Result<(), I2cErr> {
+        if self.sda.is_low() && self.scl.is_low() { return Err(I2cErr::BusBusy) }
+        self.sda.set_high(); self.scl.set_high(); self.t_quarter()
+        self.sda.set_low();  self.t_quarter()
+        self.scl.set_low();  Ok(())
+    }
+    fn stop(&mut self) { self.sda.set_low(); self.t_quarter()
+        self.scl.set_high(); self.t_quarter(); self.sda.set_high() }
+    fn tx_byte(&mut self, b: u8) -> Result<(), I2cErr> {
+        for i in (0..8).rev() { self.bit_out((b >> i) & 1 == 1) }
+        if self.bit_in() { Err(I2cErr::Nack) } else { Ok(()) }
+    }
+    fn rx_byte(&mut self, ack: bool) -> Result<u8, I2cErr> {
+        self.sda.set_as_input(); let mut b = 0u8
+        for _ in 0..8 { b = (b << 1) | if self.bit_in() { 1 } else { 0 } }
+        self.bit_out(!ack); Ok(b)
+    }
+    fn bit_out(&mut self, v: bool) { if v { self.sda.set_high() } else { self.sda.set_low() }
+        self.t_quarter(); self.scl.set_high(); self.t_quarter(); self.scl.set_low() }
+    fn bit_in(&mut self) -> bool { self.scl.set_high(); self.t_quarter()
+        let v = self.sda.is_high(); self.scl.set_low(); self.t_quarter(); v }
+    fn t_quarter(&self) { Clock::delay_ns(250_000_000 / self.freq_hz as u64) }
+}
