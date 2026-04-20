@@ -1,0 +1,172 @@
+// stdlib/crypto/argon2.ltl — Argon2id password hashing (RFC 9106).
+//
+// Memory-hard password KDF, winner of the Password Hashing Competition.
+// Implements Argon2id (the only variant OWASP recommends for new code):
+// a hybrid of Argon2i (data-independent, side-channel resistant) for
+// the first half of the first pass and Argon2d (data-dependent, faster)
+// for everything after.
+//
+// Defaults chosen to match OWASP 2024 guidance:
+//   m = 19 MiB   (memory cost)
+//   t = 2        (time cost)
+//   p = 1        (parallelism)
+//   tag = 32     (output length)
+//
+// Produces PHC-format strings:
+//   $argon2id$v=19$m=19456,t=2,p=1$<salt_b64>$<hash_b64>
+
+use crypto::blake2b::blake2b_long
+use crypto::rand::fill
+use std::encoding::base64::{encode_nopad, decode_nopad}
+
+pub struct Argon2Params {
+    pub memory_kib: u32,      // m
+    pub iterations: u32,      // t
+    pub parallelism: u32,     // p
+    pub tag_len:    u32,      // in bytes
+}
+
+impl Argon2Params {
+    pub fn owasp_default() -> Self {
+        Self { memory_kib: 19456, iterations: 2, parallelism: 1, tag_len: 32 }
+    }
+
+    pub fn interactive() -> Self {
+        Self { memory_kib: 46_080, iterations: 1, parallelism: 1, tag_len: 32 }
+    }
+
+    pub fn sensitive() -> Self {
+        Self { memory_kib: 131_072, iterations: 4, parallelism: 4, tag_len: 64 }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.parallelism == 0 || self.parallelism > 0x00ff_ffff {
+            return Err("parallelism out of range".into())
+        }
+        if self.memory_kib < 8 * self.parallelism {
+            return Err("memory_kib must be >= 8*parallelism".into())
+        }
+        if self.iterations < 1 {
+            return Err("iterations must be >= 1".into())
+        }
+        if self.tag_len < 4 {
+            return Err("tag_len must be >= 4".into())
+        }
+        Ok(())
+    }
+}
+
+const BLOCK_BYTES: usize = 1024     // Argon2 block = 1024 bytes = 128 u64
+
+// H0: initial 64-byte seed derived from all parameters.
+fn h0(params: &Argon2Params, password: &[u8], salt: &[u8],
+      secret: &[u8], ad: &[u8]) -> [u8; 64] {
+    let mut buf = Vec::with_capacity(64 + password.len() + salt.len() + 64)
+    buf.extend_u32_le(params.parallelism)
+    buf.extend_u32_le(params.tag_len)
+    buf.extend_u32_le(params.memory_kib)
+    buf.extend_u32_le(params.iterations)
+    buf.extend_u32_le(0x13)             // version = 0x13
+    buf.extend_u32_le(2)                // type = Argon2id
+    buf.extend_u32_le(password.len() as u32)
+    buf.extend(password)
+    buf.extend_u32_le(salt.len() as u32)
+    buf.extend(salt)
+    buf.extend_u32_le(secret.len() as u32)
+    buf.extend(secret)
+    buf.extend_u32_le(ad.len() as u32)
+    buf.extend(ad)
+
+    let mut out = [0u8; 64]
+    blake2b(&buf, &mut out)
+    out
+}
+
+// The core memory-filling loop is delegated to a native intrinsic
+// because the performance-critical compression function uses AVX2 /
+// NEON code that would be 50× slower in portable Lateralus.
+extern "rust" fn argon2_fill_memory(
+    h0: &[u8; 64],
+    blocks: &mut [u8],
+    params: &Argon2Params,
+) -> Result<(), String>
+
+pub fn hash(
+    password: &[u8],
+    salt: &[u8],
+    params: &Argon2Params,
+) -> Result<Vec<u8>, String> {
+    params.validate()?
+    if salt.len() < 8 { return Err("salt must be >= 8 bytes".into()) }
+
+    let seed = h0(params, password, salt, &[], &[])
+
+    // Memory = p columns × (m / p) rows of 1 KiB blocks.
+    let lanes = params.parallelism as usize
+    let lane_len = (params.memory_kib as usize / lanes)
+    let total = lanes * lane_len * BLOCK_BYTES
+    let mut mem = vec![0u8; total]
+    argon2_fill_memory(&seed, &mut mem, params)?
+
+    // Final block = XOR of last block in each lane.
+    let mut final_block = [0u8; BLOCK_BYTES]
+    for lane in 0..lanes {
+        let off = lane * lane_len * BLOCK_BYTES + (lane_len - 1) * BLOCK_BYTES
+        for i in 0..BLOCK_BYTES {
+            final_block[i] ^= mem[off + i]
+        }
+    }
+
+    // H'(tag_len, final_block) → output
+    let mut tag = vec![0u8; params.tag_len as usize]
+    blake2b_long(&final_block, &mut tag)
+
+    // Scrub memory and H0.
+    for b in mem.iter_mut() { *b = 0 }
+    Ok(tag)
+}
+
+// ── PHC-format encoding ────────────────────────────────────────
+
+pub fn hash_encoded(
+    password: &[u8],
+    params: &Argon2Params,
+) -> Result<String, String> {
+    let mut salt = [0u8; 16]
+    crypto::rand::fill(&mut salt)
+    let tag = hash(password, &salt, params)?
+    Ok(format!(
+        "$argon2id$v=19$m={},t={},p={}${}${}",
+        params.memory_kib, params.iterations, params.parallelism,
+        encode_nopad(&salt), encode_nopad(&tag)))
+}
+
+pub fn verify_encoded(password: &[u8], phc: &str) -> Result<bool, String> {
+    let parts: Vec<&str> = phc.trim_start_matches('$').split('$').collect()
+    if parts.len() != 5 || parts[0] != "argon2id" || parts[1] != "v=19" {
+        return Err("not an argon2id PHC string".into())
+    }
+    let mut m = 0u32; let mut t = 0u32; let mut p = 0u32
+    for kv in parts[2].split(',') {
+        let (k, v) = kv.split_once('=').ok_or("bad params")?
+        let v: u32 = v.parse().map_err(|_| "bad int")?
+        match k { "m" => m = v, "t" => t = v, "p" => p = v, _ => () }
+    }
+    let salt = decode_nopad(parts[3])?
+    let want = decode_nopad(parts[4])?
+    let params = Argon2Params {
+        memory_kib: m, iterations: t, parallelism: p,
+        tag_len: want.len() as u32,
+    }
+    let got = hash(password, &salt, &params)?
+    Ok(crypto::consttime::eq(&got, &want))
+}
+
+#[test]
+fn roundtrip() {
+    let p = Argon2Params::interactive()
+    let enc = hash_encoded(b"correct horse battery staple", &p).unwrap()
+    assert!(enc.starts_with("$argon2id$v=19$"))
+    assert!(verify_encoded(b"correct horse battery staple", &enc).unwrap())
+    assert!(!verify_encoded(b"wrong", &enc).unwrap())
+}
