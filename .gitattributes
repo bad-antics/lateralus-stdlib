@@ -1,0 +1,21 @@
+# GitHub Linguist overrides for Lateralus source files.
+# Until github-linguist/linguist merges our PR adding Lateralus as a
+# first-class language, these directives force GitHub to label .ltl
+# files correctly in the language bar and in language statistics.
+#
+# See: https://lateralus.dev/linguist  (status page)
+#      https://github.com/bad-antics/lateralus-lang/tree/main/docs/linguist
+
+*.ltl    linguist-language=Lateralus
+*.ltl    linguist-detectable=true
+*.ltlm   linguist-language=Lateralus
+*.ltlml  linguist-language=Lateralus
+*.ltasm  linguist-language=Lateralus
+*.ltlcfg linguist-language=Lateralus
+*.ltlnb  linguist-language=Lateralus
+*.ltlc   linguist-language=Lateralus
+*.ltbc   linguist-language=Lateralus linguist-generated=true
+
+# Vendor out large generated corpora so they don't skew the bar.
+/samples/**  linguist-vendored=true
+/examples/vendor/**  linguist-vendored=true
