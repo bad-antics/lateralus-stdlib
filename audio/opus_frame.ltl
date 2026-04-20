@@ -1,0 +1,47 @@
+// stdlib/audio/opus_frame.ltl — Opus TOC byte and frame packing (RFC 6716).
+//
+// An Opus packet starts with a table-of-contents byte encoding
+// configuration (mode, bandwidth, frame size) in bits 7-3, stereo flag
+// in bit 2, and frame count code in bits 1-0. Four framing modes:
+//   code 0: exactly 1 frame; code 1: 2 equal; code 2: 2 variable;
+//   code 3: arbitrary with a length-encoding byte.
+// Used for adaptive streaming: a classifier can cheaply inspect the
+// TOC to decide whether a packet matches a target bandwidth.
+
+pub enum Mode { SilkOnly, Hybrid, CeltOnly }
+pub enum Bandwidth { NB, MB, WB, SWB, FB }
+
+pub struct Toc { pub config: u8, pub stereo: bool, pub frame_count_code: u8,
+    pub mode: Mode, pub bandwidth: Bandwidth, pub frame_size_ms: f32 }
+
+pub fn parse_toc(b: u8) -> Toc {
+    let config = b >> 3
+    let stereo = (b & 0x04) != 0
+    let code = b & 0x03
+    let (mode, bw, fs) = classify(config)
+    Toc { config, stereo, frame_count_code: code, mode, bandwidth: bw, frame_size_ms: fs }
+}
+
+fn classify(c: u8) -> (Mode, Bandwidth, f32) {
+    // Configs from RFC 6716 §3.1.
+    match c {
+        0..=3   => (Mode::SilkOnly,  Bandwidth::NB,  [10.0, 20.0, 40.0, 60.0][c as usize]),
+        4..=7   => (Mode::SilkOnly,  Bandwidth::MB,  [10.0, 20.0, 40.0, 60.0][(c-4) as usize]),
+        8..=11  => (Mode::SilkOnly,  Bandwidth::WB,  [10.0, 20.0, 40.0, 60.0][(c-8) as usize]),
+        12..=13 => (Mode::Hybrid,    Bandwidth::SWB, [10.0, 20.0][(c-12) as usize]),
+        14..=15 => (Mode::Hybrid,    Bandwidth::FB,  [10.0, 20.0][(c-14) as usize]),
+        16..=19 => (Mode::CeltOnly,  Bandwidth::NB,  [2.5, 5.0, 10.0, 20.0][(c-16) as usize]),
+        20..=23 => (Mode::CeltOnly,  Bandwidth::WB,  [2.5, 5.0, 10.0, 20.0][(c-20) as usize]),
+        24..=27 => (Mode::CeltOnly,  Bandwidth::SWB, [2.5, 5.0, 10.0, 20.0][(c-24) as usize]),
+        _       => (Mode::CeltOnly,  Bandwidth::FB,  [2.5, 5.0, 10.0, 20.0][(c-28) as usize]),
+    }
+}
+
+pub fn frame_count(toc: &Toc, packet: &[u8]) -> u8 {
+    match toc.frame_count_code {
+        0 | 1 => 1 + (toc.frame_count_code),
+        2 => 2,
+        3 => packet[1] & 0x3F,
+        _ => unreachable!(),
+    }
+}
