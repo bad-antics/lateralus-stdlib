@@ -1,0 +1,87 @@
+// stdlib/finance/black_scholes.ltl — Black-Scholes-Merton option pricing.
+//
+// Classic closed-form European call/put prices + first- and second-order
+// Greeks: delta, gamma, vega, theta, rho. Dividend yield q baked in.
+// Normal CDF uses an Abramowitz-Stegun approximation accurate to ~1e-7.
+
+use std::math::{exp, ln, sqrt, PI}
+
+pub struct Inputs {
+    pub s: f64,        // spot
+    pub k: f64,        // strike
+    pub t: f64,        // years to expiry
+    pub r: f64,        // risk-free rate (continuous)
+    pub q: f64,        // continuous dividend yield
+    pub sigma: f64,    // vol (annualized, as a decimal)
+}
+
+pub struct Greeks {
+    pub price: f64, pub delta: f64, pub gamma: f64,
+    pub vega: f64, pub theta: f64, pub rho: f64,
+}
+
+fn norm_cdf(x: f64) -> f64 {
+    // Abramowitz-Stegun 26.2.17
+    let sign = if x < 0.0 { -1.0 } else { 1.0 }
+    let x = x.abs() / sqrt(2.0)
+    let t = 1.0 / (1.0 + 0.3275911 * x)
+    let y = 1.0 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t
+                   - 0.284496736) * t + 0.254829592) * t * exp(-x * x)
+    0.5 * (1.0 + sign * y)
+}
+
+fn norm_pdf(x: f64) -> f64 { exp(-0.5 * x * x) / sqrt(2.0 * PI) }
+
+fn d1d2(inp: &Inputs) -> (f64, f64) {
+    let d1 = (ln(inp.s / inp.k) + (inp.r - inp.q + 0.5 * inp.sigma * inp.sigma) * inp.t)
+           / (inp.sigma * sqrt(inp.t))
+    (d1, d1 - inp.sigma * sqrt(inp.t))
+}
+
+pub fn call(inp: &Inputs) -> Greeks {
+    let (d1, d2) = d1d2(inp)
+    let discount_q = exp(-inp.q * inp.t)
+    let discount_r = exp(-inp.r * inp.t)
+    let price = inp.s * discount_q * norm_cdf(d1) - inp.k * discount_r * norm_cdf(d2)
+    Greeks {
+        price,
+        delta: discount_q * norm_cdf(d1),
+        gamma: discount_q * norm_pdf(d1) / (inp.s * inp.sigma * sqrt(inp.t)),
+        vega:  inp.s * discount_q * norm_pdf(d1) * sqrt(inp.t),
+        theta: -(inp.s * discount_q * norm_pdf(d1) * inp.sigma) / (2.0 * sqrt(inp.t))
+               - inp.r * inp.k * discount_r * norm_cdf(d2)
+               + inp.q * inp.s * discount_q * norm_cdf(d1),
+        rho:   inp.k * inp.t * discount_r * norm_cdf(d2),
+    }
+}
+
+pub fn put(inp: &Inputs) -> Greeks {
+    let (d1, d2) = d1d2(inp)
+    let discount_q = exp(-inp.q * inp.t)
+    let discount_r = exp(-inp.r * inp.t)
+    let price = inp.k * discount_r * norm_cdf(-d2) - inp.s * discount_q * norm_cdf(-d1)
+    Greeks {
+        price,
+        delta: -discount_q * norm_cdf(-d1),
+        gamma: discount_q * norm_pdf(d1) / (inp.s * inp.sigma * sqrt(inp.t)),
+        vega:  inp.s * discount_q * norm_pdf(d1) * sqrt(inp.t),
+        theta: -(inp.s * discount_q * norm_pdf(d1) * inp.sigma) / (2.0 * sqrt(inp.t))
+               + inp.r * inp.k * discount_r * norm_cdf(-d2)
+               - inp.q * inp.s * discount_q * norm_cdf(-d1),
+        rho:   -inp.k * inp.t * discount_r * norm_cdf(-d2),
+    }
+}
+
+pub fn implied_vol_call(market_price: f64, inp: &Inputs) -> Option<f64> {
+    // Newton-Raphson on vega.
+    let mut inp = inp.clone(); inp.sigma = 0.3
+    for _ in 0..100 {
+        let g = call(&inp)
+        let diff = g.price - market_price
+        if diff.abs() < 1e-6 { return Some(inp.sigma) }
+        if g.vega < 1e-10 { return None }
+        inp.sigma -= diff / g.vega
+        if inp.sigma <= 0.0 { inp.sigma = 1e-4 }
+    }
+    None
+}
