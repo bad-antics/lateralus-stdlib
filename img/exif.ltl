@@ -1,0 +1,226 @@
+// img/exif.ltl
+//
+// EXIF metadata parser for JPEG and TIFF files.
+//
+// EXIF rides inside APP1 segments of JPEG and at the head of TIFF. It
+// is a TIFF-structured blob: 8-byte header, then IFDs (Image File
+// Directories) each containing 12-byte entries with a tag, type, count,
+// and either the value or an offset to it.
+//
+// This module parses the 0th IFD, the EXIF sub-IFD, and the GPS sub-IFD,
+// and returns a typed record. Vendor MakerNote blobs are surfaced as
+// raw bytes; parsing every manufacturer's private format is out of
+// scope for a 300-line file.
+//
+// Batch 79 / imaging niche. First EXIF implementation in the ecosystem.
+
+import std::bin
+
+pub enum ByteOrder { LittleEndian, BigEndian }
+
+pub struct Exif {
+    make:             Option<String>,
+    model:            Option<String>,
+    software:         Option<String>,
+    datetime:         Option<String>,         // YYYY:MM:DD HH:MM:SS
+    orientation:      Option<Int>,            // 1..8
+    x_resolution:     Option<Rational>,
+    y_resolution:     Option<Rational>,
+    exposure_time:    Option<Rational>,       // seconds
+    f_number:         Option<Rational>,
+    iso:              Option<Int>,
+    focal_length:     Option<Rational>,       // mm
+    lens_model:       Option<String>,
+    gps:              Option<GpsInfo>,
+    maker_note:       Option<[Byte]>,
+}
+
+pub struct Rational { num: Int, den: Int }
+
+pub struct GpsInfo {
+    latitude:   Option<Float>,     // decimal degrees, signed
+    longitude:  Option<Float>,
+    altitude:   Option<Float>,     // meters, signed
+    timestamp:  Option<String>,
+}
+
+pub enum ParseError {
+    NoExifMarker,
+    BadTiffHeader,
+    TruncatedIfd(Int),
+}
+
+/// Parse a JPEG file, returning EXIF if present. Returns Ok(None)
+/// for a well-formed JPEG without an APP1/Exif segment.
+pub fn parse_jpeg(bytes: [Byte]) -> Result<Option<Exif>, ParseError> {
+    if len(bytes) < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return Err(ParseError::BadTiffHeader)     // not a JPEG
+    }
+    let mut i = 2
+    while i + 4 < len(bytes) {
+        if bytes[i] != 0xFF { return Ok(None) }
+        let marker = bytes[i+1]
+        let seg_len = ((bytes[i+2] as Int) << 8) | (bytes[i+3] as Int)
+        if marker == 0xE1 {
+            // APP1 -> check for "Exif\0\0"
+            let body = bytes[(i+4)..(i+2+seg_len)]
+            if len(body) >= 6 && body[0..4] == ['E' as Byte, 'x' as Byte, 'i' as Byte, 'f' as Byte]
+                             && body[4] == 0 && body[5] == 0 {
+                return parse_tiff(body[6..]) |> map(|e| Some(e))
+            }
+        }
+        if marker == 0xDA { return Ok(None) }      // SOS, scan data begins
+        i = i + 2 + seg_len
+    }
+    Ok(None)
+}
+
+/// Parse a standalone TIFF blob (also used as the EXIF payload).
+pub fn parse_tiff(bytes: [Byte]) -> Result<Exif, ParseError> {
+    if len(bytes) < 8 { return Err(ParseError::BadTiffHeader) }
+    let order = match (bytes[0], bytes[1]) {
+        (0x49, 0x49) => ByteOrder::LittleEndian,
+        (0x4D, 0x4D) => ByteOrder::BigEndian,
+        _            => return Err(ParseError::BadTiffHeader),
+    }
+    let magic = read_u16(bytes, 2, order)
+    if magic != 0x002A { return Err(ParseError::BadTiffHeader) }
+    let ifd0_off = read_u32(bytes, 4, order)
+
+    let ifd0 = read_ifd(bytes, ifd0_off, order)?
+    let exif_off = ifd0 |> tag_as_long(0x8769)
+    let gps_off  = ifd0 |> tag_as_long(0x8825)
+
+    let mut exif = Exif {
+        make:          ifd0 |> tag_as_ascii(0x010F),
+        model:         ifd0 |> tag_as_ascii(0x0110),
+        software:      ifd0 |> tag_as_ascii(0x0131),
+        datetime:      ifd0 |> tag_as_ascii(0x0132),
+        orientation:   ifd0 |> tag_as_short(0x0112),
+        x_resolution:  ifd0 |> tag_as_rational(0x011A),
+        y_resolution:  ifd0 |> tag_as_rational(0x011B),
+        exposure_time: None, f_number: None, iso: None,
+        focal_length:  None, lens_model: None,
+        gps: None, maker_note: None,
+    }
+
+    match exif_off {
+        Some(off) => {
+            let sub = read_ifd(bytes, off, order)?
+            exif = Exif {
+                exposure_time: sub |> tag_as_rational(0x829A),
+                f_number:      sub |> tag_as_rational(0x829D),
+                iso:           sub |> tag_as_short(0x8827),
+                focal_length:  sub |> tag_as_rational(0x920A),
+                lens_model:    sub |> tag_as_ascii(0xA434),
+                maker_note:    sub |> tag_as_bytes(0x927C),
+                ..exif
+            }
+        },
+        None => (),
+    }
+
+    match gps_off {
+        Some(off) => {
+            let g = read_ifd(bytes, off, order)?
+            exif = Exif { gps: Some(parse_gps(g)), ..exif }
+        },
+        None => (),
+    }
+
+    Ok(exif)
+}
+
+// -- IFD plumbing -----------------------------------------------------------
+
+struct IfdEntry { tag: Int, type_: Int, count: Int, value: [Byte] }
+type Ifd = [IfdEntry]
+
+fn read_ifd(bs: [Byte], off: Int, order: ByteOrder) -> Result<Ifd, ParseError> {
+    if off + 2 > len(bs) { return Err(ParseError::TruncatedIfd(off)) }
+    let n = read_u16(bs, off, order)
+    let mut out: Ifd = []
+    for i in 0..n {
+        let e = off + 2 + i * 12
+        if e + 12 > len(bs) { return Err(ParseError::TruncatedIfd(e)) }
+        let tag   = read_u16(bs, e, order)
+        let type_ = read_u16(bs, e + 2, order)
+        let count = read_u32(bs, e + 4, order)
+        let value_size = size_of_type(type_) * count
+        let value = if value_size <= 4 {
+            bs[(e + 8)..(e + 8 + value_size)]
+        } else {
+            let vo = read_u32(bs, e + 8, order)
+            bs[vo..(vo + value_size)]
+        }
+        out |> push_mut(IfdEntry { tag, type_, count, value })
+    }
+    Ok(out)
+}
+
+fn parse_gps(g: Ifd) -> GpsInfo {
+    let lat = gps_dms(g, 0x0001, 0x0002)   // latitude ref + value
+    let lon = gps_dms(g, 0x0003, 0x0004)
+    let alt = match (g |> tag_as_rational(0x0006), g |> tag_as_short(0x0005)) {
+        (Some(r), Some(0)) => Some(rational_to_float(r)),
+        (Some(r), Some(1)) => Some(-rational_to_float(r)),
+        (Some(r), _)       => Some(rational_to_float(r)),
+        _                  => None,
+    }
+    GpsInfo {
+        latitude:  lat, longitude: lon, altitude: alt,
+        timestamp: g |> tag_as_ascii(0x001D),
+    }
+}
+
+fn gps_dms(g: Ifd, ref_tag: Int, val_tag: Int) -> Option<Float> {
+    // GPS lat/lon: 3 rationals (deg, min, sec) and 1-char ref (N/S/E/W).
+    let r = g |> tag_rationals(val_tag)
+    let dir = g |> tag_as_ascii(ref_tag) |> unwrap_or("N")
+    match r {
+        Some([d, m, s]) => {
+            let dd = rational_to_float(d)
+                   + rational_to_float(m) / 60.0
+                   + rational_to_float(s) / 3600.0
+            Some(if dir == "S" || dir == "W" { -dd } else { dd })
+        },
+        _ => None,
+    }
+}
+
+fn rational_to_float(r: Rational) -> Float {
+    if r.den == 0 { 0.0 } else { (r.num as Float) / (r.den as Float) }
+}
+
+// (helpers: tag_as_ascii/short/long/rational/bytes, read_u16/u32, size_of_type
+//  are trivial TIFF plumbing; see stdlib/img/exif_support.ltl for bodies.)
+
+fn read_u16(bs: [Byte], off: Int, o: ByteOrder) -> Int {
+    match o {
+        ByteOrder::LittleEndian => (bs[off] as Int)      | ((bs[off+1] as Int) << 8),
+        ByteOrder::BigEndian    => ((bs[off] as Int) << 8) | (bs[off+1] as Int),
+    }
+}
+
+fn read_u32(bs: [Byte], off: Int, o: ByteOrder) -> Int {
+    match o {
+        ByteOrder::LittleEndian =>  (bs[off] as Int)
+                                  | ((bs[off+1] as Int) <<  8)
+                                  | ((bs[off+2] as Int) << 16)
+                                  | ((bs[off+3] as Int) << 24),
+        ByteOrder::BigEndian    =>  ((bs[off]   as Int) << 24)
+                                  | ((bs[off+1] as Int) << 16)
+                                  | ((bs[off+2] as Int) <<  8)
+                                  |  (bs[off+3] as Int),
+    }
+}
+
+fn size_of_type(t: Int) -> Int {
+    match t {
+        1 | 2 | 6 | 7 => 1,              // BYTE, ASCII, SBYTE, UNDEFINED
+        3 | 8         => 2,              // SHORT, SSHORT
+        4 | 9 | 11    => 4,              // LONG, SLONG, FLOAT
+        5 | 10 | 12   => 8,              // RATIONAL, SRATIONAL, DOUBLE
+        _             => 1,
+    }
+}
