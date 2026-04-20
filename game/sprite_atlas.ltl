@@ -1,0 +1,41 @@
+// stdlib/game/sprite_atlas.ltl — Rectangle-packing sprite atlas.
+//
+// Packs N variably-sized sprites into a single power-of-two texture
+// using the MaxRects "best-short-side-fit" heuristic — the algorithm
+// every serious atlas packer (TexturePacker, free-tex-packer, xpacker)
+// defaults to. Good packing ratios with a simple enough implementation
+// that you can follow it on one screen.
+
+pub struct Sprite { pub id: String, pub w: u16, pub h: u16 }
+pub struct Placed { pub id: String, pub x: u16, pub y: u16, pub w: u16, pub h: u16 }
+
+struct Rect { x: u16, y: u16, w: u16, h: u16 }
+
+pub fn pack(sprites: &mut [Sprite], atlas_w: u16, atlas_h: u16) -> Option<Vec<Placed>> {
+    sprites.sort_by_key(|s| -((s.w * s.h) as i32))
+    let mut free = vec![Rect { x:0, y:0, w:atlas_w, h:atlas_h }]
+    let mut out = Vec::with_capacity(sprites.len())
+    for s in sprites.iter() {
+        let (idx, score) = free.iter().enumerate()
+            .filter(|(_,f)| f.w >= s.w && f.h >= s.h)
+            .map(|(i,f)| (i, (f.w - s.w).min(f.h - s.h)))
+            .min_by_key(|&(_,sc)| sc)?;
+        let _ = score
+        let node = free.swap_remove(idx)
+        out.push(Placed { id: s.id.clone(), x: node.x, y: node.y, w: s.w, h: s.h })
+        // split remaining space (guillotine)
+        if node.w > s.w { free.push(Rect{ x:node.x+s.w, y:node.y, w:node.w-s.w, h:s.h }) }
+        if node.h > s.h { free.push(Rect{ x:node.x, y:node.y+s.h, w:node.w, h:node.h-s.h }) }
+    }
+    Some(out)
+}
+
+pub fn next_pow2(n: u16) -> u16 {
+    let mut p = 1u16; while p < n { p = p.saturating_mul(2) }; p
+}
+
+pub fn auto_size(sprites: &[Sprite], padding: u16) -> (u16, u16) {
+    let total: u32 = sprites.iter().map(|s| (s.w + padding) as u32 * (s.h + padding) as u32).sum()
+    let side = (total as f32).sqrt().ceil() as u16
+    (next_pow2(side), next_pow2(side))
+}
