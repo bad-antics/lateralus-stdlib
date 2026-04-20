@@ -1,0 +1,57 @@
+// stdlib/image/qoi.ltl — Quite OK Image format (Dominic Szablewski, 2021).
+//
+// QOI encodes each pixel with one of: INDEX (hash of a 64-pixel array),
+// RUN (repeat), DIFF (small delta), LUMA (medium delta), or RGB/RGBA
+// (literal). Lossless, often beats PNG on encode/decode speed by 20×.
+// We implement the full spec (no compression fallback needed).
+
+const OP_RGB: u8  = 0xFE;   const OP_RGBA: u8 = 0xFF
+const OP_INDEX: u8 = 0x00;  const OP_DIFF: u8 = 0x40
+const OP_LUMA: u8  = 0x80;  const OP_RUN: u8  = 0xC0
+const MASK: u8     = 0xC0
+
+pub struct Pixel { pub r: u8, pub g: u8, pub b: u8, pub a: u8 }
+
+fn hash(p: Pixel) -> usize {
+    ((p.r as usize).wrapping_mul(3)
+     + (p.g as usize).wrapping_mul(5)
+     + (p.b as usize).wrapping_mul(7)
+     + (p.a as usize).wrapping_mul(11)) & 63
+}
+
+pub fn encode(pixels: &[Pixel], w: u32, h: u32, alpha: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(14 + pixels.len() * 5 + 8)
+    out.extend_from_slice(b"qoif")
+    out.extend_from_slice(&w.to_be_bytes()); out.extend_from_slice(&h.to_be_bytes())
+    out.push(if alpha { 4 } else { 3 }); out.push(0)  // channels, sRGB linear
+    let mut index = [Pixel { r:0, g:0, b:0, a:0 }; 64]
+    let mut prev = Pixel { r:0, g:0, b:0, a:255 }; let mut run = 0u8
+    for (i, &p) in pixels.iter().enumerate() {
+        if p == prev {
+            run += 1
+            if run == 62 || i == pixels.len() - 1 { out.push(OP_RUN | (run - 1)); run = 0 }
+            prev = p; continue
+        }
+        if run > 0 { out.push(OP_RUN | (run - 1)); run = 0 }
+        let h = hash(p)
+        if index[h] == p { out.push(OP_INDEX | h as u8); prev = p; continue }
+        index[h] = p
+        if p.a == prev.a {
+            let dr = p.r.wrapping_sub(prev.r) as i8
+            let dg = p.g.wrapping_sub(prev.g) as i8
+            let db = p.b.wrapping_sub(prev.b) as i8
+            if dr >= -2 && dr <= 1 && dg >= -2 && dg <= 1 && db >= -2 && db <= 1 {
+                out.push(OP_DIFF | (((dr + 2) as u8) << 4) | (((dg + 2) as u8) << 2) | ((db + 2) as u8))
+            } else {
+                let dr_dg = dr.wrapping_sub(dg); let db_dg = db.wrapping_sub(dg)
+                if dg >= -32 && dg <= 31 && dr_dg >= -8 && dr_dg <= 7 && db_dg >= -8 && db_dg <= 7 {
+                    out.push(OP_LUMA | ((dg + 32) as u8))
+                    out.push((((dr_dg + 8) as u8) << 4) | ((db_dg + 8) as u8))
+                } else { out.push(OP_RGB); out.extend_from_slice(&[p.r, p.g, p.b]) }
+            }
+        } else { out.push(OP_RGBA); out.extend_from_slice(&[p.r, p.g, p.b, p.a]) }
+        prev = p
+    }
+    out.extend_from_slice(&[0,0,0,0,0,0,0,1])  // end marker
+    out
+}
