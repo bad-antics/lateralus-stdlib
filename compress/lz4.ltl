@@ -1,0 +1,57 @@
+// stdlib/compress/lz4.ltl — LZ4 block-format decoder + encoder.
+//
+// Pure-Lateralus reference implementation. Matches the LZ4 "block"
+// format (not the LZ4-Frame wrapper). Encoder is O(n) with a 14-bit
+// hash table; decoder is standard token-literal-match dispatch.
+
+pub fn decompress(src: &[u8], dst_max: usize) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(dst_max); let mut p = 0
+    while p < src.len() {
+        let tok = src[p]; p += 1
+        let mut lit_len = (tok >> 4) as usize
+        if lit_len == 15 { while { let b=src[p]; p+=1; lit_len += b as usize; b==255 } {} }
+        if p + lit_len > src.len() { return Err("lit overrun".into()) }
+        out.extend_from_slice(&src[p..p+lit_len]); p += lit_len
+        if p == src.len() { break }
+        let off = (src[p] as usize) | ((src[p+1] as usize) << 8); p += 2
+        if off == 0 || off > out.len() { return Err("bad offset".into()) }
+        let mut m_len = (tok & 0x0f) as usize + 4
+        if (tok & 0x0f) == 15 { while { let b=src[p]; p+=1; m_len += b as usize; b==255 } {} }
+        let start = out.len() - off
+        for i in 0..m_len { let v = out[start+i]; out.push(v) }
+    }
+    Ok(out)
+}
+
+pub fn compress(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() + src.len()/255 + 16)
+    let mut tbl = [0u32; 1 << 14]        // hash → position
+    let mut anchor = 0usize; let mut p = 0usize
+    let hash = |x: u32| ((x.wrapping_mul(2654435761)) >> 18) as usize
+    while p + 12 < src.len() {
+        let word = u32::from_le_bytes(src[p..p+4].try_into().unwrap())
+        let h = hash(word); let candidate = tbl[h] as usize; tbl[h] = p as u32
+        if candidate > 0 && p - candidate < 65536
+            && &src[candidate..candidate+4] == &src[p..p+4] {
+            let lit = &src[anchor..p]; let mut ml = 4
+            while p + ml < src.len() - 5 && src[candidate+ml] == src[p+ml] { ml += 1 }
+            emit_seq(&mut out, lit, p - candidate, ml); p += ml; anchor = p; continue
+        }
+        p += 1
+    }
+    emit_seq(&mut out, &src[anchor..], 0, 0); out
+}
+
+fn emit_seq(out: &mut Vec<u8>, lit: &[u8], offset: usize, match_len: usize) {
+    let ml_tok = if match_len == 0 { 0 } else { match_len - 4 }
+    let tok_hi = if lit.len() >= 15 { 15 } else { lit.len() as u8 }
+    let tok_lo = if ml_tok >= 15 { 15u8 } else { ml_tok as u8 }
+    out.push((tok_hi << 4) | tok_lo)
+    if lit.len() >= 15 { let mut r = lit.len() - 15
+        while r >= 255 { out.push(255); r -= 255 }; out.push(r as u8) }
+    out.extend_from_slice(lit)
+    if match_len == 0 { return }
+    out.push((offset & 0xff) as u8); out.push(((offset >> 8) & 0xff) as u8)
+    if ml_tok >= 15 { let mut r = ml_tok - 15
+        while r >= 255 { out.push(255); r -= 255 }; out.push(r as u8) }
+}
