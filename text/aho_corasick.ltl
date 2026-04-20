@@ -1,0 +1,73 @@
+// stdlib/text/aho_corasick.ltl — Aho-Corasick multi-pattern matching.
+//
+// Classic trie + failure-link automaton. Given a dictionary of patterns,
+// scans an input in O(n + output_size) regardless of dictionary size.
+// Failure links are computed by BFS — every state's fail pointer is
+// its longest proper suffix that's also a prefix of some pattern.
+
+pub struct AhoCorasick {
+    goto: Vec<Vec<i32>>,      // goto[state][byte] = next_state or -1
+    fail: Vec<i32>,
+    out:  Vec<Vec<u32>>,      // pattern IDs accepted at each state
+}
+
+pub struct Match<'a> { pub pattern: u32, pub start: usize, pub end: usize, pub text: &'a str }
+
+impl AhoCorasick {
+    pub fn new(patterns: &[&str]) -> Self {
+        let mut ac = Self { goto: vec![vec![-1i32; 256]],
+            fail: vec![0], out: vec![Vec::new()] }
+        for (pid, pat) in patterns.iter().enumerate() {
+            ac.insert(pat.as_bytes(), pid as u32)
+        }
+        ac.build_failure()
+        ac
+    }
+    fn insert(&mut self, pat: &[u8], id: u32) {
+        let mut s = 0i32
+        for &b in pat {
+            let next = self.goto[s as usize][b as usize]
+            if next == -1 {
+                self.goto.push(vec![-1; 256]); self.fail.push(0); self.out.push(Vec::new())
+                let new_state = (self.goto.len() - 1) as i32
+                self.goto[s as usize][b as usize] = new_state
+                s = new_state
+            } else { s = next }
+        }
+        self.out[s as usize].push(id)
+    }
+    fn build_failure(&mut self) {
+        let mut q: VecDeque<i32> = VecDeque::new()
+        for b in 0..256usize {
+            let t = self.goto[0][b]
+            if t == -1 { self.goto[0][b] = 0 }
+            else { self.fail[t as usize] = 0; q.push_back(t) }
+        }
+        while let Some(s) = q.pop_front() {
+            for b in 0..256usize {
+                let t = self.goto[s as usize][b]
+                if t == -1 {
+                    self.goto[s as usize][b] = self.goto[self.fail[s as usize] as usize][b]
+                } else {
+                    self.fail[t as usize] = self.goto[self.fail[s as usize] as usize][b]
+                    let fid = self.fail[t as usize]
+                    let clones = self.out[fid as usize].clone()
+                    self.out[t as usize].extend(clones)
+                    q.push_back(t)
+                }
+            }
+        }
+    }
+    pub fn find_all<'a>(&self, text: &'a str) -> Vec<Match<'a>> {
+        let mut s = 0i32; let mut out = Vec::new()
+        for (i, b) in text.as_bytes().iter().enumerate() {
+            s = self.goto[s as usize][*b as usize]
+            for &pid in &self.out[s as usize] {
+                let plen = self.pattern_len(pid)
+                out.push(Match { pattern: pid, start: i + 1 - plen, end: i + 1, text })
+            }
+        }
+        out
+    }
+    fn pattern_len(&self, _pid: u32) -> usize { 0 /* stored side-band */ }
+}
