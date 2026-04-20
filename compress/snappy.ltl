@@ -1,0 +1,59 @@
+// stdlib/compress/snappy.ltl — Google Snappy block format.
+//
+// Google's "just make it fast" compressor. Not as dense as LZ4 but
+// slightly simpler to decode and used by Cassandra, Kafka, Parquet.
+// Format: varint uncompressed size, then tag bytes driving one of
+// four tag types (literal, copy-1, copy-2, copy-4).
+
+pub fn decompress(src: &[u8]) -> Result<Vec<u8>, String> {
+    let mut p = 0usize
+    let mut shift = 0u32; let mut size = 0u64
+    loop {
+        if p >= src.len() { return Err("short varint".into()) }
+        let b = src[p]; p += 1
+        size |= ((b & 0x7f) as u64) << shift
+        if b & 0x80 == 0 { break }
+        shift += 7; if shift > 35 { return Err("varint overflow".into()) }
+    }
+    let mut out = Vec::with_capacity(size as usize)
+    while p < src.len() {
+        let tag = src[p]; p += 1
+        match tag & 0x03 {
+            0 => {
+                let len = match tag >> 2 {
+                    0..=59 => (tag >> 2) as usize + 1,
+                    60 => { let v=src[p] as usize+1; p+=1; v }
+                    61 => { let v=u16::from_le_bytes(src[p..p+2].try_into().unwrap()) as usize+1; p+=2; v }
+                    62 => { let mut v=0usize; for i in 0..3 { v |= (src[p+i] as usize)<<(8*i) }; p+=3; v+1 }
+                    _  => { let v=u32::from_le_bytes(src[p..p+4].try_into().unwrap()) as usize+1; p+=4; v }
+                }
+                if p + len > src.len() { return Err("lit overrun".into()) }
+                out.extend_from_slice(&src[p..p+len]); p += len
+            }
+            1 => {
+                let len = (((tag >> 2) & 0x07) as usize) + 4
+                let off = (((tag >> 5) as usize) << 8) | src[p] as usize; p += 1
+                copy_back(&mut out, off, len)?
+            }
+            2 => {
+                let len = ((tag >> 2) as usize) + 1
+                let off = u16::from_le_bytes(src[p..p+2].try_into().unwrap()) as usize; p += 2
+                copy_back(&mut out, off, len)?
+            }
+            _ => {
+                let len = ((tag >> 2) as usize) + 1
+                let off = u32::from_le_bytes(src[p..p+4].try_into().unwrap()) as usize; p += 4
+                copy_back(&mut out, off, len)?
+            }
+        }
+    }
+    if out.len() as u64 != size { return Err("size mismatch".into()) }
+    Ok(out)
+}
+
+fn copy_back(out: &mut Vec<u8>, off: usize, len: usize) -> Result<(), String> {
+    if off == 0 || off > out.len() { return Err("bad copy offset".into()) }
+    let start = out.len() - off
+    for i in 0..len { let v=out[start+i]; out.push(v) }
+    Ok(())
+}
