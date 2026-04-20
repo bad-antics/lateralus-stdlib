@@ -1,0 +1,87 @@
+// stdlib/game/aabb_tree.ltl — Dynamic AABB tree (Box2D-style broadphase).
+//
+// The broadphase used by every modern 2D physics engine: an axis-aligned
+// bounding-box BVH that supports insert, remove, move, and query in
+// roughly O(log n). Fatter leaf boxes (padded) drastically reduce tree
+// rebuilding when objects move a little.
+
+pub struct Aabb { pub minx: f32, pub miny: f32, pub maxx: f32, pub maxy: f32 }
+
+impl Aabb {
+    pub fn area(&self) -> f32 { (self.maxx-self.minx) * (self.maxy-self.miny) }
+    pub fn union(&self, o: &Aabb) -> Aabb {
+        Aabb { minx: self.minx.min(o.minx), miny: self.miny.min(o.miny),
+               maxx: self.maxx.max(o.maxx), maxy: self.maxy.max(o.maxy) }
+    }
+    pub fn contains(&self, o: &Aabb) -> bool {
+        self.minx<=o.minx && self.miny<=o.miny && self.maxx>=o.maxx && self.maxy>=o.maxy
+    }
+    pub fn overlaps(&self, o: &Aabb) -> bool {
+        self.minx<=o.maxx && self.maxx>=o.minx && self.miny<=o.maxy && self.maxy>=o.miny
+    }
+    pub fn fattened(&self, m: f32) -> Aabb {
+        Aabb { minx:self.minx-m, miny:self.miny-m, maxx:self.maxx+m, maxy:self.maxy+m }
+    }
+}
+
+pub type NodeId = i32
+pub const NULL: NodeId = -1
+pub const FATTEN: f32 = 0.1
+
+struct Node { aabb: Aabb, parent: NodeId, left: NodeId, right: NodeId,
+              user: u32, height: i16, active: bool }
+
+pub struct AabbTree { nodes: Vec<Node>, root: NodeId, free: NodeId }
+
+impl AabbTree {
+    pub fn new() -> Self { Self { nodes: Vec::new(), root: NULL, free: NULL } }
+
+    pub fn insert(&mut self, b: &Aabb, user: u32) -> NodeId {
+        let id = self.alloc_node(b.fattened(FATTEN), user)
+        if self.root == NULL { self.root = id; return id }
+        // Best-sibling selection by Surface Area Heuristic.
+        let mut cur = self.root
+        loop {
+            let n = &self.nodes[cur as usize]
+            if n.left == NULL { break }
+            let combined = n.aabb.union(&self.nodes[id as usize].aabb).area()
+            let left = &self.nodes[n.left as usize]; let right = &self.nodes[n.right as usize]
+            let cost_l = self.nodes[id as usize].aabb.union(&left.aabb).area() - left.aabb.area()
+            let cost_r = self.nodes[id as usize].aabb.union(&right.aabb).area() - right.aabb.area()
+            if combined < cost_l && combined < cost_r { break }
+            cur = if cost_l < cost_r { n.left } else { n.right }
+        }
+        let sibling = cur
+        let old_parent = self.nodes[sibling as usize].parent
+        let new_parent = self.alloc_node(
+            self.nodes[sibling as usize].aabb.union(&self.nodes[id as usize].aabb), 0)
+        self.nodes[new_parent as usize].left  = sibling
+        self.nodes[new_parent as usize].right = id
+        self.nodes[sibling as usize].parent = new_parent
+        self.nodes[id      as usize].parent = new_parent
+        self.nodes[new_parent as usize].parent = old_parent
+        if old_parent == NULL { self.root = new_parent }
+        else if self.nodes[old_parent as usize].left == sibling {
+            self.nodes[old_parent as usize].left = new_parent
+        } else { self.nodes[old_parent as usize].right = new_parent }
+        id
+    }
+
+    pub fn query<F: FnMut(u32)>(&self, q: &Aabb, mut cb: F) {
+        let mut stack = vec![self.root]
+        while let Some(id) = stack.pop() {
+            if id == NULL { continue }
+            let n = &self.nodes[id as usize]
+            if !n.active || !n.aabb.overlaps(q) { continue }
+            if n.left == NULL { cb(n.user) }
+            else { stack.push(n.left); stack.push(n.right) }
+        }
+    }
+
+    fn alloc_node(&mut self, b: Aabb, user: u32) -> NodeId {
+        let id = self.nodes.len() as NodeId
+        self.nodes.push(Node { aabb: b, parent: NULL, left: NULL, right: NULL,
+            user, height: 0, active: true })
+        id
+    }
+}
