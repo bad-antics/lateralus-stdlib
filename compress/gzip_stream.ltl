@@ -1,0 +1,57 @@
+// stdlib/compress/gzip_stream.ltl — streaming gzip (.gz) container.
+//
+// Wraps a DEFLATE implementation (provided by `deflate::` elsewhere)
+// in the RFC 1952 gzip framing: magic, method, flags, timestamp,
+// optional FNAME/FCOMMENT/FHCRC, trailing CRC32 + ISIZE. The
+// "streaming" part means we emit bytes as we go, so multi-GiB
+// files don't need to fit in memory.
+
+use compress::deflate
+use std::io::{Reader, Writer}
+use hash::crc32
+
+pub const MAGIC: u16 = 0x8b1f
+
+pub struct GzHeader {
+    pub mtime: u32, pub name: Option<String>, pub comment: Option<String>,
+    pub os: u8, pub xfl: u8,
+}
+
+pub fn encode_stream<W: Writer>(w: &mut W, data: &[u8], hdr: &GzHeader) -> Result<(), String> {
+    let mut flags = 0u8
+    if hdr.name.is_some()    { flags |= 0x08 }
+    if hdr.comment.is_some() { flags |= 0x10 }
+    w.write_all(&[0x1f, 0x8b, 0x08, flags])?
+    w.write_u32_le(hdr.mtime)?
+    w.write_all(&[hdr.xfl, hdr.os])?
+    if let Some(n) = &hdr.name    { w.write_all(n.as_bytes())?; w.write_all(b"\0")? }
+    if let Some(c) = &hdr.comment { w.write_all(c.as_bytes())?; w.write_all(b"\0")? }
+    deflate::encode(w, data)?
+    w.write_u32_le(crc32::hash(data))?
+    w.write_u32_le(data.len() as u32)?    // ISIZE mod 2^32
+    Ok(())
+}
+
+pub fn decode_header<R: Reader>(r: &mut R) -> Result<GzHeader, String> {
+    let magic = u16::from_le_bytes([r.read_u8()?, r.read_u8()?])
+    if magic != MAGIC { return Err("not gzip".into()) }
+    if r.read_u8()? != 0x08 { return Err("unsupported method".into()) }
+    let flags = r.read_u8()?
+    let mtime = r.read_u32_le()?
+    let xfl = r.read_u8()?; let os = r.read_u8()?
+    if flags & 0x04 != 0 { let n = r.read_u16_le()?; let _ = r.read_bytes(n as usize)? }
+    let name = if flags & 0x08 != 0 { Some(r.read_cstring()?) } else { None }
+    let comment = if flags & 0x10 != 0 { Some(r.read_cstring()?) } else { None }
+    if flags & 0x02 != 0 { let _ = r.read_u16_le()? }     // header CRC16
+    Ok(GzHeader { mtime, name, comment, os, xfl })
+}
+
+pub fn decode_stream<R: Reader, W: Writer>(r: &mut R, w: &mut W) -> Result<(), String> {
+    let _hdr = decode_header(r)?
+    let (out_len, crc) = deflate::decode_streaming(r, w)?
+    let want_crc = r.read_u32_le()?
+    let want_len = r.read_u32_le()?
+    if crc != want_crc { return Err("crc mismatch".into()) }
+    if (out_len as u32) != want_len { return Err("isize mismatch".into()) }
+    Ok(())
+}
