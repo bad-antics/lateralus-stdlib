@@ -1,0 +1,61 @@
+// stdlib/hw/uart.ltl — 8-N-1 UART, interrupt-driven ring buffers.
+//
+// Assumes a HAL-provided `UartRegs` with standard TX/RX FIFO plus
+// overrun/framing/parity status bits. Wraps the MMIO block in a
+// Rx/Tx ring buffer pair and exposes nonblocking `try_read`,
+// `try_write`, and blocking `read_line`.
+
+use hw::hal::UartRegs
+use std::sync::RingBuf
+
+pub struct Uart {
+    pub regs: &'static mut UartRegs,
+    pub rx: RingBuf<u8>,
+    pub tx: RingBuf<u8>,
+}
+
+pub enum UartErr { Overrun, Framing, Parity, WouldBlock }
+
+impl Uart {
+    pub fn configure(&mut self, baud: u32, clk_hz: u32) {
+        self.regs.disable()
+        self.regs.set_divisor(clk_hz / (16 * baud))
+        self.regs.set_lcr_8n1()
+        self.regs.enable_rx_interrupt()
+        self.regs.enable()
+    }
+    pub fn try_write(&mut self, b: u8) -> Result<(), UartErr> {
+        if self.regs.tx_ready() { self.regs.tx_write(b); Ok(()) }
+        else if self.tx.push(b) { Ok(()) }
+        else { Err(UartErr::WouldBlock) }
+    }
+    pub fn try_read(&mut self) -> Option<u8> { self.rx.pop() }
+    pub fn read_line(&mut self, buf: &mut [u8]) -> usize {
+        let mut n = 0
+        while n < buf.len() {
+            if let Some(b) = self.try_read() {
+                if b == b'\n' { return n }
+                if b == b'\r' { continue }
+                buf[n] = b; n += 1
+            }
+        }
+        n
+    }
+    pub fn write_all(&mut self, bytes: &[u8]) {
+        for &b in bytes { while self.try_write(b).is_err() { /* spin */ } }
+    }
+    pub fn irq_handler(&mut self) {
+        while self.regs.rx_has_data() {
+            let status = self.regs.lsr()
+            let b = self.regs.rx_read()
+            if status & 0x02 != 0 { /* overrun — drop */ continue }
+            let _ = self.rx.push(b)
+        }
+        while self.regs.tx_ready() {
+            match self.tx.pop() {
+                Some(b) => self.regs.tx_write(b),
+                None => { self.regs.disable_tx_interrupt(); break }
+            }
+        }
+    }
+}
