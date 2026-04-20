@@ -1,0 +1,77 @@
+// stdlib/game/ecs.ltl — Minimal archetype-based ECS.
+//
+// Entity = opaque u64 (index + generation). Components live in dense
+// Vec<T> arrays grouped by archetype (exact component set). Queries
+// iterate only the archetypes that include the requested components,
+// so `for (pos, vel) in world.query::<(Position, Velocity)>()` is cache-
+// friendly even with hundreds of component types in the world.
+
+use std::collections::Map
+use std::any::TypeId
+
+pub type Entity = u64
+
+pub struct World {
+    archetypes: Vec<Archetype>,
+    entity_loc: Map<Entity, (u32, u32)>,  // archetype_idx, row
+    next_id: u64,
+}
+
+struct Archetype {
+    ids:  Vec<TypeId>,
+    cols: Map<TypeId, Box<dyn Column>>,
+    rows: u32,
+}
+
+trait Column {
+    fn len(&self) -> u32
+    fn swap_remove(&mut self, row: u32)
+}
+struct Col<T> { v: Vec<T> }
+impl<T: 'static> Column for Col<T> {
+    fn len(&self) -> u32 { self.v.len() as u32 }
+    fn swap_remove(&mut self, row: u32) { self.v.swap_remove(row as usize); }
+}
+
+impl World {
+    pub fn new() -> Self {
+        Self { archetypes: Vec::new(), entity_loc: Map::new(), next_id: 1 }
+    }
+
+    pub fn spawn<B: ComponentBundle>(&mut self, bundle: B) -> Entity {
+        let id = self.next_id; self.next_id += 1
+        let ids = bundle.type_ids()
+        let a_idx = self.find_or_make(&ids)
+        bundle.push_into(&mut self.archetypes[a_idx as usize])
+        let row = self.archetypes[a_idx as usize].rows; self.archetypes[a_idx as usize].rows += 1
+        self.entity_loc.insert(id, (a_idx, row))
+        id
+    }
+
+    pub fn despawn(&mut self, e: Entity) {
+        if let Some((a, r)) = self.entity_loc.remove(&e) {
+            let arch = &mut self.archetypes[a as usize]
+            for col in arch.cols.values_mut() { col.swap_remove(r) }
+            arch.rows -= 1
+        }
+    }
+
+    pub fn query<Q: Query>(&mut self) -> impl Iterator<Item = Q::Item> + '_ {
+        Q::iter(&self.archetypes)
+    }
+
+    fn find_or_make(&mut self, ids: &[TypeId]) -> u32 {
+        if let Some(i) = self.archetypes.iter().position(|a| a.ids == ids) {
+            return i as u32
+        }
+        self.archetypes.push(Archetype { ids: ids.to_vec(), cols: Map::new(), rows: 0 })
+        (self.archetypes.len() - 1) as u32
+    }
+}
+
+pub trait ComponentBundle {
+    fn type_ids(&self) -> Vec<TypeId>
+    fn push_into(self, a: &mut Archetype)
+}
+
+pub trait Query { type Item; fn iter(archs: &[Archetype]) -> Box<dyn Iterator<Item=Self::Item> + '_> }
