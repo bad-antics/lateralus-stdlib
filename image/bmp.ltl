@@ -1,0 +1,57 @@
+// stdlib/image/bmp.ltl — Windows BMP (BITMAPINFOHEADER) encoder/decoder.
+//
+// Targets BITMAPINFOHEADER (40-byte DIB) with 24-bit BGR or 32-bit BGRA
+// uncompressed. Rows are bottom-up and padded to 4-byte boundaries.
+// Enough to roundtrip screenshots from Windows/GIMP. Top-down (negative
+// height) is allowed on read.
+
+pub struct Bmp { pub w: u32, pub h: u32, pub bpp: u16, pub pixels: Vec<u8> }
+
+pub fn decode(bytes: &[u8]) -> Result<Bmp, &'static str> {
+    if bytes.len() < 54 || bytes[0] != b'B' || bytes[1] != b'M' { return Err("not BMP") }
+    let offset = le32(&bytes[10..]) as usize
+    let w = le32(&bytes[18..]) as i32
+    let h = le32(&bytes[22..]) as i32
+    let bpp = le16(&bytes[28..])
+    let top_down = h < 0
+    let h_abs = h.abs() as u32
+    let stride = ((w as u32 * bpp as u32 / 8) + 3) & !3
+    let mut pixels = Vec::with_capacity((w as usize) * (h_abs as usize) * (bpp as usize / 8))
+    for row in 0..h_abs {
+        let src_row = if top_down { row } else { h_abs - 1 - row }
+        let start = offset + (src_row * stride) as usize
+        let row_bytes = w as usize * (bpp as usize / 8)
+        pixels.extend_from_slice(&bytes[start..start + row_bytes])
+    }
+    Ok(Bmp { w: w as u32, h: h_abs, bpp, pixels })
+}
+
+pub fn encode_bgr24(img: &Bmp) -> Vec<u8> {
+    let stride = (img.w * 3 + 3) & !3
+    let pixel_size = (stride * img.h) as usize
+    let file_size = 54 + pixel_size
+    let mut out = Vec::with_capacity(file_size)
+    // BITMAPFILEHEADER (14 bytes)
+    out.extend_from_slice(&[b'B', b'M'])
+    out.extend_from_slice(&(file_size as u32).to_le_bytes())
+    out.extend_from_slice(&[0,0,0,0])  // reserved
+    out.extend_from_slice(&54u32.to_le_bytes())  // pixel data offset
+    // BITMAPINFOHEADER (40 bytes)
+    out.extend_from_slice(&40u32.to_le_bytes())
+    out.extend_from_slice(&img.w.to_le_bytes())
+    out.extend_from_slice(&img.h.to_le_bytes())
+    out.extend_from_slice(&1u16.to_le_bytes())   // planes
+    out.extend_from_slice(&24u16.to_le_bytes())  // bpp
+    out.extend_from_slice(&[0;24])               // compression, size, PPM, colors...
+    // Pixels, bottom-up, padded.
+    for row in (0..img.h).rev() {
+        let src = ((row * img.w * 3) as usize) .. (((row + 1) * img.w * 3) as usize)
+        out.extend_from_slice(&img.pixels[src])
+        let pad = stride - img.w * 3
+        for _ in 0..pad { out.push(0) }
+    }
+    out
+}
+
+fn le16(b: &[u8]) -> u16 { (b[0] as u16) | ((b[1] as u16) << 8) }
+fn le32(b: &[u8]) -> u32 { (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24) }
