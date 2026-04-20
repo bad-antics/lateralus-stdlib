@@ -1,0 +1,66 @@
+// stdlib/audio/wav.ltl — RIFF WAVE (PCM and IEEE float) roundtrip.
+//
+// Parses the RIFF chunk tree, reads the "fmt " chunk (format tag 1 =
+// PCM, 3 = IEEE float), and exposes interleaved samples as i16/i32/f32.
+// Writes back with canonical chunk ordering: RIFF → fmt  → data. No
+// support for cue/LIST/smpl metadata; see `audio::wav_meta` for that.
+
+pub struct Wav { pub channels: u16, pub sample_rate: u32,
+    pub bits_per_sample: u16, pub samples_i16: Vec<i16>,
+    pub samples_f32: Vec<f32> }
+
+pub fn decode(bytes: &[u8]) -> Result<Wav, &'static str> {
+    if &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" { return Err("not WAVE") }
+    let mut i = 12
+    let mut fmt = (1u16, 0u16, 0u32, 0u16)  // tag, channels, rate, bps
+    let mut data: &[u8] = &[]
+    while i + 8 <= bytes.len() {
+        let id = &bytes[i..i+4]; let sz = le32(&bytes[i+4..]) as usize; i += 8
+        match id {
+            b"fmt " => {
+                fmt = (le16(&bytes[i..]), le16(&bytes[i+2..]),
+                       le32(&bytes[i+4..]), le16(&bytes[i+14..]))
+            }
+            b"data" => { data = &bytes[i..i+sz] }
+            _ => {}
+        }
+        i += sz + (sz & 1)  // chunks are 2-byte aligned
+    }
+    let (tag, ch, rate, bps) = fmt
+    let mut w = Wav { channels: ch, sample_rate: rate, bits_per_sample: bps,
+        samples_i16: Vec::new(), samples_f32: Vec::new() }
+    match (tag, bps) {
+        (1, 16) => w.samples_i16 = data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect(),
+        (1, 24) => w.samples_i16 = data.chunks_exact(3).map(|c| {
+            let v = (c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16)
+            let v = if v & 0x800000 != 0 { v | !0xFFFFFFi32 } else { v }
+            (v >> 8) as i16
+        }).collect(),
+        (3, 32) => w.samples_f32 = data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect(),
+        _ => return Err("unsupported format"),
+    }
+    Ok(w)
+}
+
+pub fn encode_pcm16(w: &Wav) -> Vec<u8> {
+    let data_size = w.samples_i16.len() * 2
+    let mut out = Vec::with_capacity(44 + data_size)
+    out.extend_from_slice(b"RIFF")
+    out.extend_from_slice(&((36 + data_size) as u32).to_le_bytes())
+    out.extend_from_slice(b"WAVEfmt ")
+    out.extend_from_slice(&16u32.to_le_bytes())
+    out.extend_from_slice(&1u16.to_le_bytes())
+    out.extend_from_slice(&w.channels.to_le_bytes())
+    out.extend_from_slice(&w.sample_rate.to_le_bytes())
+    let byte_rate = w.sample_rate * w.channels as u32 * 2
+    out.extend_from_slice(&byte_rate.to_le_bytes())
+    out.extend_from_slice(&(w.channels * 2).to_le_bytes())
+    out.extend_from_slice(&16u16.to_le_bytes())
+    out.extend_from_slice(b"data")
+    out.extend_from_slice(&(data_size as u32).to_le_bytes())
+    for &s in &w.samples_i16 { out.extend_from_slice(&s.to_le_bytes()) }
+    out
+}
+
+fn le16(b: &[u8]) -> u16 { (b[0] as u16) | ((b[1] as u16) << 8) }
+fn le32(b: &[u8]) -> u32 { (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24) }
