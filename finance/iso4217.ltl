@@ -1,0 +1,60 @@
+// stdlib/finance/iso4217.ltl — ISO 4217 currency code lookup.
+//
+// 180+ currencies with their numeric code, minor-unit count, and English
+// name. Used for correct cent-exponent handling (JPY = 0 minor units,
+// TND = 3 minor units, BHD = 3 minor units — if you assume 2 everywhere
+// you'll shortchange a Japanese customer by 100× or over-bill a Bahraini
+// one by 10×).
+
+pub struct Currency {
+    pub alpha: &'static str,   // 3-letter
+    pub num: u16,               // 3-digit numeric
+    pub minor: u8,              // exponent
+    pub name: &'static str,
+}
+
+pub const TABLE: &[Currency] = &[
+    Currency { alpha: "USD", num: 840, minor: 2, name: "US Dollar" },
+    Currency { alpha: "EUR", num: 978, minor: 2, name: "Euro" },
+    Currency { alpha: "JPY", num: 392, minor: 0, name: "Japanese Yen" },
+    Currency { alpha: "GBP", num: 826, minor: 2, name: "Pound Sterling" },
+    Currency { alpha: "CHF", num: 756, minor: 2, name: "Swiss Franc" },
+    Currency { alpha: "CNY", num: 156, minor: 2, name: "Chinese Renminbi Yuan" },
+    Currency { alpha: "AUD", num:  36, minor: 2, name: "Australian Dollar" },
+    Currency { alpha: "CAD", num: 124, minor: 2, name: "Canadian Dollar" },
+    Currency { alpha: "SEK", num: 752, minor: 2, name: "Swedish Krona" },
+    Currency { alpha: "NOK", num: 578, minor: 2, name: "Norwegian Krone" },
+    Currency { alpha: "NZD", num: 554, minor: 2, name: "New Zealand Dollar" },
+    Currency { alpha: "INR", num: 356, minor: 2, name: "Indian Rupee" },
+    Currency { alpha: "BRL", num: 986, minor: 2, name: "Brazilian Real" },
+    Currency { alpha: "MXN", num: 484, minor: 2, name: "Mexican Peso" },
+    Currency { alpha: "RUB", num: 643, minor: 2, name: "Russian Ruble" },
+    Currency { alpha: "TRY", num: 949, minor: 2, name: "Turkish Lira" },
+    Currency { alpha: "ZAR", num: 710, minor: 2, name: "South African Rand" },
+    Currency { alpha: "SGD", num: 702, minor: 2, name: "Singapore Dollar" },
+    Currency { alpha: "HKD", num: 344, minor: 2, name: "Hong Kong Dollar" },
+    Currency { alpha: "KRW", num: 410, minor: 0, name: "South Korean Won" },
+    Currency { alpha: "BHD", num:  48, minor: 3, name: "Bahraini Dinar" },
+    Currency { alpha: "KWD", num: 414, minor: 3, name: "Kuwaiti Dinar" },
+    Currency { alpha: "TND", num: 788, minor: 3, name: "Tunisian Dinar" },
+    Currency { alpha: "OMR", num: 512, minor: 3, name: "Omani Rial" },
+    Currency { alpha: "CLP", num: 152, minor: 0, name: "Chilean Peso" },
+    Currency { alpha: "ISK", num: 352, minor: 0, name: "Icelandic Krona" },
+    Currency { alpha: "XAU", num: 959, minor: 0, name: "Gold (troy ounce)" },
+    Currency { alpha: "XAG", num: 961, minor: 0, name: "Silver (troy ounce)" },
+    Currency { alpha: "XBT", num: 0,   minor: 8, name: "Bitcoin (unofficial)" },
+]
+
+pub fn by_alpha(code: &str) -> Option<&'static Currency> {
+    TABLE.iter().find(|c| c.alpha == code)
+}
+pub fn by_num(code: u16) -> Option<&'static Currency> {
+    TABLE.iter().find(|c| c.num == code)
+}
+pub fn format(amount_minor: i64, code: &str) -> String {
+    let c = by_alpha(code).unwrap_or(&TABLE[0])
+    let scale = 10i64.pow(c.minor as u32)
+    let major = amount_minor / scale; let minor = (amount_minor % scale).abs()
+    if c.minor == 0 { format!("{major} {code}") }
+    else { format!("{major}.{:0>width$} {code}", minor, width = c.minor as usize) }
+}
