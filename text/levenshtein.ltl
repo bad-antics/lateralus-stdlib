@@ -1,0 +1,57 @@
+// stdlib/text/levenshtein.ltl — Edit distance with Wagner-Fischer +
+// Ukkonen diagonal band optimization.
+//
+// For a typical 80-char input the band optimization cuts work from
+// O(nm) to O(n·k) where k is the max-allowed distance. Falls back to
+// full matrix when k is large. Supports unicode scalar values (not
+// grapheme clusters — that's what `text::grapheme_distance` is for).
+
+pub fn distance(a: &str, b: &str) -> usize {
+    distance_bounded(a, b, usize::MAX)
+}
+
+pub fn distance_bounded(a: &str, b: &str, k: usize) -> usize {
+    let a: Vec<char> = a.chars().collect()
+    let b: Vec<char> = b.chars().collect()
+    let (a, b) = if a.len() < b.len() { (a, b) } else { (b, a) }
+    if b.len() - a.len() > k { return k + 1 }
+
+    let m = a.len(); let n = b.len()
+    let mut prev: Vec<usize> = (0..=m).collect()
+    let mut cur: Vec<usize> = vec![0; m + 1]
+
+    for j in 1..=n {
+        cur[0] = j
+        let lo = j.saturating_sub(k); let hi = (j + k).min(m)
+        let mut row_min = j
+        for i in 1..=m {
+            if i < lo { cur[i] = k + 1; continue }
+            if i > hi { cur[i] = k + 1; continue }
+            let substitution_cost = if a[i-1] == b[j-1] { 0 } else { 1 }
+            cur[i] = (prev[i] + 1)
+                .min(cur[i-1] + 1)
+                .min(prev[i-1] + substitution_cost)
+            if cur[i] < row_min { row_min = cur[i] }
+        }
+        if row_min > k { return k + 1 }
+        std::mem::swap(&mut prev, &mut cur)
+    }
+    prev[m]
+}
+
+pub fn similarity(a: &str, b: &str) -> f32 {
+    let m = a.chars().count(); let n = b.chars().count()
+    let max = m.max(n)
+    if max == 0 { return 1.0 }
+    1.0 - (distance(a, b) as f32 / max as f32)
+}
+
+pub fn closest<'a>(query: &str, candidates: &'a [&str], max_dist: usize) -> Option<&'a str> {
+    candidates.iter().copied()
+        .filter_map(|c| {
+            let d = distance_bounded(query, c, max_dist)
+            if d <= max_dist { Some((c, d)) } else { None }
+        })
+        .min_by_key(|&(_,d)| d)
+        .map(|(c,_)| c)
+}
