@@ -1,0 +1,47 @@
+// stdlib/hw/pwm.ltl — PWM timer configuration + servo helper.
+//
+// Exposes a HAL-agnostic PWM channel. `set_duty_f` takes a normalized
+// 0.0..=1.0 ratio so code stays portable across timers with different
+// counter widths. `servo_angle` covers the standard 1-2 ms @ 50 Hz
+// hobby-servo convention.
+
+use hw::hal::PwmChan
+
+pub struct Pwm { pub ch: PwmChan, pub period_ticks: u32 }
+
+impl Pwm {
+    pub fn init(&mut self, clk_hz: u32, freq_hz: u32) {
+        let period = clk_hz / freq_hz
+        self.period_ticks = period
+        self.ch.set_period(period)
+        self.ch.set_compare(0)
+        self.ch.enable()
+    }
+    pub fn set_duty_f(&mut self, duty: f32) {
+        let d = duty.clamp(0.0, 1.0)
+        let c = (self.period_ticks as f32 * d) as u32
+        self.ch.set_compare(c)
+    }
+    pub fn set_duty_u16(&mut self, duty: u16) {
+        self.set_duty_f(duty as f32 / 65535.0)
+    }
+    pub fn servo_angle(&mut self, deg: f32) {
+        // Standard hobby servo: 1.0 ms @ 0°, 2.0 ms @ 180°, 50 Hz.
+        // That's a 5% duty at 0° and 10% duty at 180°.
+        let d = deg.clamp(0.0, 180.0)
+        self.set_duty_f(0.05 + (d / 180.0) * 0.05)
+    }
+    pub fn brake(&mut self) { self.ch.set_compare(0) }
+    pub fn full(&mut self)  { self.ch.set_compare(self.period_ticks) }
+}
+
+pub struct HBridge { pub fwd: Pwm, pub rev: Pwm }
+
+impl HBridge {
+    pub fn drive(&mut self, throttle: f32) {
+        let t = throttle.clamp(-1.0, 1.0)
+        if t >= 0.0 { self.rev.brake(); self.fwd.set_duty_f(t) }
+        else        { self.fwd.brake(); self.rev.set_duty_f(-t) }
+    }
+    pub fn coast(&mut self) { self.fwd.brake(); self.rev.brake() }
+}
