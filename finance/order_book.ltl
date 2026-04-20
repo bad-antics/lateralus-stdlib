@@ -1,0 +1,79 @@
+// stdlib/finance/order_book.ltl — Price-time priority limit-order book.
+//
+// Matches a stream of limit and market orders using price-time (FIFO)
+// priority. Two half-books (bids, asks) each implemented as a BTreeMap
+// keyed by price, with a deque per price level. Partial fills keep the
+// remaining size; fully-filled orders are evicted. Operates in integer
+// ticks — no floating point anywhere near the matching loop.
+
+use std::collections::{BTreeMap, VecDeque}
+
+pub type Ticks  = i64
+pub type Qty    = u64
+pub type OrdId  = u64
+pub type Side   = i8               // +1 = bid, -1 = ask
+
+pub struct Order { pub id: OrdId, pub side: Side, pub px: Ticks, pub qty: Qty }
+pub struct Fill  { pub maker: OrdId, pub taker: OrdId, pub px: Ticks, pub qty: Qty }
+
+pub struct Book {
+    bids: BTreeMap<Ticks, VecDeque<Order>>,       // descending iter: reverse view
+    asks: BTreeMap<Ticks, VecDeque<Order>>,
+}
+
+impl Book {
+    pub fn new() -> Self { Self { bids: BTreeMap::new(), asks: BTreeMap::new() } }
+
+    pub fn best_bid(&self) -> Option<Ticks> { self.bids.keys().next_back().copied() }
+    pub fn best_ask(&self) -> Option<Ticks> { self.asks.keys().next().copied() }
+    pub fn spread(&self) -> Option<Ticks> { Some(self.best_ask()? - self.best_bid()?) }
+
+    pub fn submit_limit(&mut self, mut o: Order) -> (Vec<Fill>, Option<OrdId>) {
+        let (fills, remaining) = self.try_match(&mut o)
+        if let Some(mut rest) = remaining {
+            let book = if o.side > 0 { &mut self.bids } else { &mut self.asks }
+            book.entry(rest.px).or_insert_with(VecDeque::new).push_back(rest.clone())
+            return (fills, Some(rest.id))
+        }
+        (fills, None)
+    }
+
+    pub fn submit_market(&mut self, mut o: Order) -> Vec<Fill> {
+        o.px = if o.side > 0 { Ticks::MAX } else { Ticks::MIN }
+        self.try_match(&mut o).0
+    }
+
+    fn try_match(&mut self, taker: &mut Order) -> (Vec<Fill>, Option<Order>) {
+        let mut fills = Vec::new()
+        loop {
+            let best = if taker.side > 0 { self.best_ask() } else { self.best_bid() }
+            let Some(px) = best else { break }
+            let acceptable = if taker.side > 0 { taker.px >= px } else { taker.px <= px }
+            if !acceptable { break }
+            let book = if taker.side > 0 { &mut self.asks } else { &mut self.bids }
+            let level = book.get_mut(&px).unwrap()
+            while let Some(maker) = level.front_mut() {
+                if taker.qty == 0 { break }
+                let fill_qty = taker.qty.min(maker.qty)
+                fills.push(Fill { maker: maker.id, taker: taker.id, px, qty: fill_qty })
+                taker.qty -= fill_qty; maker.qty -= fill_qty
+                if maker.qty == 0 { level.pop_front(); } else { break }
+            }
+            if level.is_empty() { book.remove(&px); }
+            if taker.qty == 0 { break }
+        }
+        let remaining = if taker.qty > 0 { Some(taker.clone()) } else { None }
+        (fills, remaining)
+    }
+
+    pub fn cancel(&mut self, id: OrdId) -> bool {
+        for book in [&mut self.bids, &mut self.asks] {
+            for (_, level) in book.iter_mut() {
+                if let Some(idx) = level.iter().position(|o| o.id == id) {
+                    level.remove(idx); return true
+                }
+            }
+        }
+        false
+    }
+}
