@@ -1,0 +1,59 @@
+// stdlib/net/ntp_v4.ltl — NTPv4 (RFC 5905) client packet codec.
+//
+// 48-byte fixed-format packet over UDP 123. Time fields are 64-bit
+// "NTP short" (16.16 s for root delay/dispersion) or "NTP timestamp"
+// (32.32 seconds-since-1900). Unix-epoch conversion: Unix epoch 1970
+// is 2208988800 seconds after NTP epoch 1900. A client sends LI=0,
+// VN=4, Mode=3 (client), sets Transmit Timestamp to its clock, and
+// expects the server to fill Receive/Transmit timestamps in reply.
+
+pub const NTP_EPOCH_OFFSET_SECS: u64 = 2_208_988_800
+
+pub struct Packet {
+    pub leap: u8, pub version: u8, pub mode: u8, pub stratum: u8,
+    pub poll: i8, pub precision: i8, pub root_delay: u32, pub root_dispersion: u32,
+    pub ref_id: [u8; 4],
+    pub ref_ts: u64, pub orig_ts: u64, pub recv_ts: u64, pub xmit_ts: u64,
+}
+
+pub fn encode(p: &Packet) -> [u8; 48] {
+    let mut out = [0u8; 48]
+    out[0] = (p.leap << 6) | (p.version << 3) | (p.mode & 7)
+    out[1] = p.stratum; out[2] = p.poll as u8; out[3] = p.precision as u8
+    out[4..8].copy_from_slice(&p.root_delay.to_be_bytes())
+    out[8..12].copy_from_slice(&p.root_dispersion.to_be_bytes())
+    out[12..16].copy_from_slice(&p.ref_id)
+    out[16..24].copy_from_slice(&p.ref_ts.to_be_bytes())
+    out[24..32].copy_from_slice(&p.orig_ts.to_be_bytes())
+    out[32..40].copy_from_slice(&p.recv_ts.to_be_bytes())
+    out[40..48].copy_from_slice(&p.xmit_ts.to_be_bytes())
+    out
+}
+
+pub fn decode(bytes: &[u8; 48]) -> Packet {
+    let rd = u32::from_be_bytes(bytes[4..8].try_into().unwrap())
+    let rdi = u32::from_be_bytes(bytes[8..12].try_into().unwrap())
+    let mut ref_id = [0u8; 4]; ref_id.copy_from_slice(&bytes[12..16])
+    Packet {
+        leap: bytes[0] >> 6, version: (bytes[0] >> 3) & 7, mode: bytes[0] & 7,
+        stratum: bytes[1], poll: bytes[2] as i8, precision: bytes[3] as i8,
+        root_delay: rd, root_dispersion: rdi, ref_id,
+        ref_ts: u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
+        orig_ts: u64::from_be_bytes(bytes[24..32].try_into().unwrap()),
+        recv_ts: u64::from_be_bytes(bytes[32..40].try_into().unwrap()),
+        xmit_ts: u64::from_be_bytes(bytes[40..48].try_into().unwrap()),
+    }
+}
+
+pub fn unix_to_ntp(unix_sec: u64, unix_frac: u64) -> u64 {
+    ((unix_sec + NTP_EPOCH_OFFSET_SECS) << 32) | (unix_frac & 0xFFFF_FFFF)
+}
+pub fn ntp_to_unix(ntp: u64) -> (u64, u64) {
+    let secs = (ntp >> 32).saturating_sub(NTP_EPOCH_OFFSET_SECS)
+    (secs, ntp & 0xFFFF_FFFF)
+}
+
+pub fn offset_estimate(t1: u64, t2: u64, t3: u64, t4: u64) -> i64 {
+    // Classic NTP formula: θ = ((t2 - t1) + (t3 - t4)) / 2
+    ((t2 as i64 - t1 as i64) + (t3 as i64 - t4 as i64)) / 2
+}
