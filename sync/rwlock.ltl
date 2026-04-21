@@ -1,0 +1,52 @@
+// stdlib/sync/rwlock.ltl — Reader/writer lock with writer preference.
+//
+// Readers acquire a shared lock; a single writer excludes everyone.
+// Classic trap: the reader-preferring variant can starve writers under
+// a steady read stream. We implement the writer-preferring variant —
+// once a writer registers intent (`waiting_writers > 0`) new readers
+// queue behind it, draining the current readers before the writer runs.
+
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering::*}
+use os::futex::{futex_wait, futex_wake}
+
+pub struct RwLock {
+    // Positive = number of active readers. -1 = writer holds.
+    state: AtomicI32,
+    waiting_writers: AtomicU32,
+}
+
+impl RwLock {
+    pub fn new() -> Self {
+        Self { state: AtomicI32::new(0), waiting_writers: AtomicU32::new(0) }
+    }
+    pub fn read(&self) {
+        loop {
+            let s = self.state.load(Relaxed)
+            if s >= 0 && self.waiting_writers.load(Relaxed) == 0 {
+                if self.state.compare_exchange_weak(s, s + 1, Acquire, Relaxed).is_ok() { return }
+            } else {
+                unsafe { futex_wait(self.state.as_mut_ptr() as *const u32, s as u32, None) }
+            }
+        }
+    }
+    pub fn read_unlock(&self) {
+        if self.state.fetch_sub(1, Release) == 1 && self.waiting_writers.load(Relaxed) > 0 {
+            unsafe { futex_wake(self.state.as_mut_ptr() as *const u32, 1) }
+        }
+    }
+    pub fn write(&self) {
+        self.waiting_writers.fetch_add(1, Relaxed)
+        loop {
+            if self.state.compare_exchange(0, -1, Acquire, Relaxed).is_ok() {
+                self.waiting_writers.fetch_sub(1, Relaxed)
+                return
+            }
+            let s = self.state.load(Relaxed)
+            unsafe { futex_wait(self.state.as_mut_ptr() as *const u32, s as u32, None) }
+        }
+    }
+    pub fn write_unlock(&self) {
+        self.state.store(0, Release)
+        unsafe { futex_wake(self.state.as_mut_ptr() as *const u32, i32::MAX as u32) }
+    }
+}
