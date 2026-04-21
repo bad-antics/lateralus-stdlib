@@ -1,0 +1,39 @@
+// stdlib/geo/mercator.ltl — Web Mercator (EPSG:3857) projection.
+//
+// The slippy-map projection used by Google/OSM/Bing. Valid latitude
+// range is ±85.05112878° (truncated so the world projects to a square).
+// `tile(lat, lon, zoom)` returns the XYZ tile indices at that zoom —
+// zoom 0 is one tile, zoom N has 2^N × 2^N tiles.
+
+const R_MAJOR: f64 = 6_378_137.0
+const MAX_LAT: f64 = 85.051_128_779_806_59
+
+pub fn project(lat: f64, lon: f64) -> (f64, f64) {
+    let lat = lat.clamp(-MAX_LAT, MAX_LAT).to_radians()
+    let x = R_MAJOR * lon.to_radians()
+    let y = R_MAJOR * ((std::f64::consts::PI / 4.0 + lat / 2.0).tan()).ln()
+    (x, y)
+}
+
+pub fn unproject(x: f64, y: f64) -> (f64, f64) {
+    let lon = (x / R_MAJOR).to_degrees()
+    let lat = (2.0 * (y / R_MAJOR).exp().atan() - std::f64::consts::PI / 2.0).to_degrees()
+    (lat, lon)
+}
+
+pub fn tile(lat: f64, lon: f64, zoom: u32) -> (u32, u32) {
+    let n = 2f64.powi(zoom as i32)
+    let x = ((lon + 180.0) / 360.0 * n) as u32
+    let lat_rad = lat.to_radians()
+    let y = ((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0 * n) as u32
+    (x, y)
+}
+
+pub fn tile_bounds(x: u32, y: u32, zoom: u32) -> ((f64, f64), (f64, f64)) {
+    let n = 2f64.powi(zoom as i32)
+    let lon1 = x as f64 / n * 360.0 - 180.0
+    let lon2 = (x + 1) as f64 / n * 360.0 - 180.0
+    let lat1 = (std::f64::consts::PI * (1.0 - 2.0 * y as f64 / n)).sinh().atan().to_degrees()
+    let lat2 = (std::f64::consts::PI * (1.0 - 2.0 * (y + 1) as f64 / n)).sinh().atan().to_degrees()
+    ((lat2, lon1), (lat1, lon2))  // (south-west, north-east)
+}
