@@ -1,0 +1,43 @@
+// stdlib/os/syscall_table.ltl — x86-64 Linux syscall numbers and decoder.
+//
+// Kernel/userspace ABI: rax = syscall number, arguments in rdi/rsi/rdx/
+// r10/r8/r9, return in rax (errno is -rax when rax < 0). Table is
+// frozen per ABI — this is arch/x86/entry/syscalls/syscall_64.tbl
+// upstream. Useful for strace clones, seccomp filter builders, and
+// sandboxing policy engines.
+
+pub struct SyscallInfo { pub name: &'static str, pub nargs: u8 }
+
+pub fn lookup(nr: u64) -> Option<&'static SyscallInfo> {
+    TABLE.get(nr as usize).copied().flatten().as_ref()
+}
+
+pub fn name(nr: u64) -> &'static str {
+    lookup(nr).map(|si| si.name).unwrap_or("<unknown>")
+}
+
+// Abridged — production code would autogenerate from the upstream table.
+const TABLE: &[Option<&SyscallInfo>] = &[
+    Some(&SyscallInfo { name: "read", nargs: 3 }),
+    Some(&SyscallInfo { name: "write", nargs: 3 }),
+    Some(&SyscallInfo { name: "open", nargs: 3 }),
+    Some(&SyscallInfo { name: "close", nargs: 1 }),
+    Some(&SyscallInfo { name: "stat", nargs: 2 }),
+    Some(&SyscallInfo { name: "fstat", nargs: 2 }),
+    Some(&SyscallInfo { name: "lstat", nargs: 2 }),
+    Some(&SyscallInfo { name: "poll", nargs: 3 }),
+    Some(&SyscallInfo { name: "lseek", nargs: 3 }),
+    Some(&SyscallInfo { name: "mmap", nargs: 6 }),
+    Some(&SyscallInfo { name: "mprotect", nargs: 3 }),
+    Some(&SyscallInfo { name: "munmap", nargs: 2 }),
+    Some(&SyscallInfo { name: "brk", nargs: 1 }),
+    Some(&SyscallInfo { name: "rt_sigaction", nargs: 4 }),
+    Some(&SyscallInfo { name: "rt_sigprocmask", nargs: 4 }),
+    Some(&SyscallInfo { name: "rt_sigreturn", nargs: 0 }),
+    Some(&SyscallInfo { name: "ioctl", nargs: 3 }),
+    // ... truncated; full table at src/os/syscall_table_full.ltl
+]
+
+pub fn errno_from_retval(rax: i64) -> Option<i32> {
+    if rax < 0 && rax >= -4095 { Some(-rax as i32) } else { None }
+}
