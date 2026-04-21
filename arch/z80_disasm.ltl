@@ -1,79 +1,190 @@
-// stdlib/arch/z80_disasm.ltl — Z80 disassembler (no prefix + CB/DD/ED/FD).
+// stdlib/arch/z80_disasm.ltl — Z80 disassembler (unprefixed + CB/DD/ED/FD).
 //
 // The Zilog Z80 (1976) powers the Game Boy, ZX Spectrum, MSX, TRS-80,
-// and a thousand arcade boards. 8-bit CPU with 4-bit prefix-opcode
-// tables: CB (bit ops), DD (IX-indexed), ED (extended), FD (IY). We
-// decode the unprefixed map + CB + ED; DD/FD are handled by swapping
-// HL→IX/IY in the mnemonic tables.
+// and many 1980s arcade boards. 8-bit CPU with a prefix-opcode
+// scheme: CB (rotate/bit), ED (extended), DD (IX-indexed), FD
+// (IY-indexed). DD/FD swap HL→IX/IY in the main map and enable
+// displacement forms for (HL), written as (IX+d) / (IY+d). DDCB/FDCB
+// are CB-indexed; the displacement comes *before* the opcode.
 
 pub struct Insn { pub mnemonic: String, pub len: u8 }
 
 pub fn disassemble_one(bytes: &[u8]) -> Option<Insn> {
     if bytes.is_empty() { return None }
     match bytes[0] {
-        0xCB => decode_cb(bytes.get(1)?),
-        0xED => decode_ed(bytes.get(1)?),
+        0xCB => decode_cb(bytes, "HL", 0),
+        0xED => decode_ed(bytes),
         0xDD => decode_ix(bytes, "IX"),
         0xFD => decode_ix(bytes, "IY"),
-        op   => Some(decode_main(op, bytes)),
+        op   => Some(decode_main(op, bytes, "HL")),
     }
 }
 
-fn decode_main(op: u8, bytes: &[u8]) -> Insn {
-    // x = top 2 bits, y = bits 5..3, z = bottom 3 bits.
-    let x = op >> 6; let y = (op >> 3) & 7; let z = op & 7
-    match (x, y, z) {
-        (0, 0, 0) => Insn { mnemonic: "NOP".into(), len: 1 },
-        (0, 1, 0) => Insn { mnemonic: format!("EX AF, AF'"), len: 1 },
-        (0, _, 1) if y & 1 == 0 => {
-            let rp = ["BC", "DE", "HL", "SP"][y as usize / 2]
-            let imm = u16::from_le_bytes([bytes[1], bytes[2]])
-            Insn { mnemonic: format!("LD {}, 0x{:04X}", rp, imm), len: 3 }
-        }
-        (0, _, 6) => {
-            let r = ["B", "C", "D", "E", "H", "L", "(HL)", "A"][y as usize]
-            Insn { mnemonic: format!("LD {}, 0x{:02X}", r, bytes[1]), len: 2 }
-        }
-        (1, 6, 6) => Insn { mnemonic: "HALT".into(), len: 1 },
-        (1, _, _) => {
-            let d = ["B","C","D","E","H","L","(HL)","A"][y as usize]
-            let s = ["B","C","D","E","H","L","(HL)","A"][z as usize]
-            Insn { mnemonic: format!("LD {}, {}", d, s), len: 1 }
-        }
-        (2, _, _) => {
-            let alu = ["ADD A,", "ADC A,", "SUB", "SBC A,", "AND", "XOR", "OR", "CP"][y as usize]
-            let s = ["B","C","D","E","H","L","(HL)","A"][z as usize]
-            Insn { mnemonic: format!("{} {}", alu, s), len: 1 }
-        }
-        (3, 0, 1) => Insn { mnemonic: format!("POP {}", ["BC","DE","HL","AF"][y as usize / 2]), len: 1 },
-        (3, 1, 1) => Insn { mnemonic: "RET".into(), len: 1 },
+// ─── Unprefixed main map (and the DD/FD reskin via `hl`) ────────────
+
+fn decode_main(op: u8, bytes: &[u8], hl: &str) -> Insn {
+    // Split per the classic Z80 opcode decomposition (x-y-z / p-q).
+    let x = op >> 6
+    let y = (op >> 3) & 7
+    let z = op & 7
+    let p = y >> 1
+    let q = y & 1
+    let rp  = ["BC", "DE", hl, "SP"]
+    let rp2 = ["BC", "DE", hl, "AF"]
+    let r   = ["B", "C", "D", "E", reg_h(hl), reg_l(hl), "(HL)", "A"]
+    let cc  = ["NZ", "Z", "NC", "C", "PO", "PE", "P", "M"]
+    let alu = ["ADD A,", "ADC A,", "SUB", "SBC A,", "AND", "XOR", "OR", "CP"]
+
+    match (x, z, q, p, y) {
+        // x=0
+        (0, 0, _, _, 0) => Insn { mnemonic: "NOP".into(), len: 1 },
+        (0, 0, _, _, 1) => Insn { mnemonic: "EX AF, AF'".into(), len: 1 },
+        (0, 0, _, _, 2) => Insn { mnemonic: format!("DJNZ ${:+}", bytes[1] as i8), len: 2 },
+        (0, 0, _, _, 3) => Insn { mnemonic: format!("JR ${:+}", bytes[1] as i8), len: 2 },
+        (0, 0, _, _, 4..=7) => Insn { mnemonic: format!("JR {}, ${:+}", cc[(y - 4) as usize], bytes[1] as i8), len: 2 },
+        (0, 1, 0, _, _) => Insn { mnemonic: format!("LD {}, 0x{:04X}", rp[p as usize], u16_le(bytes, 1)), len: 3 },
+        (0, 1, 1, _, _) => Insn { mnemonic: format!("ADD {}, {}", hl, rp[p as usize]), len: 1 },
+        (0, 2, 0, 0, _) => Insn { mnemonic: "LD (BC), A".into(), len: 1 },
+        (0, 2, 0, 1, _) => Insn { mnemonic: "LD (DE), A".into(), len: 1 },
+        (0, 2, 0, 2, _) => Insn { mnemonic: format!("LD (0x{:04X}), {}", u16_le(bytes, 1), hl), len: 3 },
+        (0, 2, 0, 3, _) => Insn { mnemonic: format!("LD (0x{:04X}), A", u16_le(bytes, 1)), len: 3 },
+        (0, 2, 1, 0, _) => Insn { mnemonic: "LD A, (BC)".into(), len: 1 },
+        (0, 2, 1, 1, _) => Insn { mnemonic: "LD A, (DE)".into(), len: 1 },
+        (0, 2, 1, 2, _) => Insn { mnemonic: format!("LD {}, (0x{:04X})", hl, u16_le(bytes, 1)), len: 3 },
+        (0, 2, 1, 3, _) => Insn { mnemonic: format!("LD A, (0x{:04X})", u16_le(bytes, 1)), len: 3 },
+        (0, 3, 0, _, _) => Insn { mnemonic: format!("INC {}", rp[p as usize]), len: 1 },
+        (0, 3, 1, _, _) => Insn { mnemonic: format!("DEC {}", rp[p as usize]), len: 1 },
+        (0, 4, _, _, _) => Insn { mnemonic: format!("INC {}", r[y as usize]), len: 1 },
+        (0, 5, _, _, _) => Insn { mnemonic: format!("DEC {}", r[y as usize]), len: 1 },
+        (0, 6, _, _, _) => Insn { mnemonic: format!("LD {}, 0x{:02X}", r[y as usize], bytes[1]), len: 2 },
+        (0, 7, _, _, 0) => Insn { mnemonic: "RLCA".into(), len: 1 },
+        (0, 7, _, _, 1) => Insn { mnemonic: "RRCA".into(), len: 1 },
+        (0, 7, _, _, 2) => Insn { mnemonic: "RLA".into(), len: 1 },
+        (0, 7, _, _, 3) => Insn { mnemonic: "RRA".into(), len: 1 },
+        (0, 7, _, _, 4) => Insn { mnemonic: "DAA".into(), len: 1 },
+        (0, 7, _, _, 5) => Insn { mnemonic: "CPL".into(), len: 1 },
+        (0, 7, _, _, 6) => Insn { mnemonic: "SCF".into(), len: 1 },
+        (0, 7, _, _, 7) => Insn { mnemonic: "CCF".into(), len: 1 },
+
+        // x=1 — LD r, r' ; 0x76 is HALT
+        (1, _, _, _, _) if y == 6 && z == 6 => Insn { mnemonic: "HALT".into(), len: 1 },
+        (1, _, _, _, _) => Insn { mnemonic: format!("LD {}, {}", r[y as usize], r[z as usize]), len: 1 },
+
+        // x=2 — ALU r
+        (2, _, _, _, _) => Insn { mnemonic: format!("{} {}", alu[y as usize], r[z as usize]), len: 1 },
+
+        // x=3 — assorted
+        (3, 0, _, _, _) => Insn { mnemonic: format!("RET {}", cc[y as usize]), len: 1 },
+        (3, 1, 0, _, _) => Insn { mnemonic: format!("POP {}", rp2[p as usize]), len: 1 },
+        (3, 1, 1, 0, _) => Insn { mnemonic: "RET".into(), len: 1 },
+        (3, 1, 1, 1, _) => Insn { mnemonic: "EXX".into(), len: 1 },
+        (3, 1, 1, 2, _) => Insn { mnemonic: format!("JP ({})", hl), len: 1 },
+        (3, 1, 1, 3, _) => Insn { mnemonic: format!("LD SP, {}", hl), len: 1 },
+        (3, 2, _, _, _) => Insn { mnemonic: format!("JP {}, 0x{:04X}", cc[y as usize], u16_le(bytes, 1)), len: 3 },
+        (3, 3, _, _, 0) => Insn { mnemonic: format!("JP 0x{:04X}", u16_le(bytes, 1)), len: 3 },
+        (3, 3, _, _, 2) => Insn { mnemonic: format!("OUT (0x{:02X}), A", bytes[1]), len: 2 },
+        (3, 3, _, _, 3) => Insn { mnemonic: format!("IN A, (0x{:02X})", bytes[1]), len: 2 },
+        (3, 3, _, _, 4) => Insn { mnemonic: format!("EX (SP), {}", hl), len: 1 },
+        (3, 3, _, _, 5) => Insn { mnemonic: "EX DE, HL".into(), len: 1 },
+        (3, 3, _, _, 6) => Insn { mnemonic: "DI".into(), len: 1 },
+        (3, 3, _, _, 7) => Insn { mnemonic: "EI".into(), len: 1 },
+        (3, 4, _, _, _) => Insn { mnemonic: format!("CALL {}, 0x{:04X}", cc[y as usize], u16_le(bytes, 1)), len: 3 },
+        (3, 5, 0, _, _) => Insn { mnemonic: format!("PUSH {}", rp2[p as usize]), len: 1 },
+        (3, 5, 1, 0, _) => Insn { mnemonic: format!("CALL 0x{:04X}", u16_le(bytes, 1)), len: 3 },
+        (3, 6, _, _, _) => Insn { mnemonic: format!("{} 0x{:02X}", alu[y as usize], bytes[1]), len: 2 },
+        (3, 7, _, _, _) => Insn { mnemonic: format!("RST 0x{:02X}", y * 8), len: 1 },
+
         _ => Insn { mnemonic: format!(".db 0x{:02X}", op), len: 1 },
     }
 }
 
-fn decode_cb(op: &u8) -> Option<Insn> {
-    let r = ["B","C","D","E","H","L","(HL)","A"][(*op & 7) as usize]
-    let (op_class, arg) = ((*op >> 6), (*op >> 3) & 7)
-    let mnem = match op_class {
-        0 => ["RLC","RRC","RL","RR","SLA","SRA","SLL","SRL"][arg as usize],
-        1 => return Some(Insn { mnemonic: format!("BIT {}, {}", arg, r), len: 2 }),
-        2 => return Some(Insn { mnemonic: format!("RES {}, {}", arg, r), len: 2 }),
-        _ => return Some(Insn { mnemonic: format!("SET {}, {}", arg, r), len: 2 }),
+// ─── CB prefix: rotates + BIT/RES/SET ───────────────────────────────
+
+fn decode_cb(bytes: &[u8], hl: &str, base_len: u8) -> Option<Insn> {
+    // With DDCB/FDCB, the byte order is DD/FD CB disp op (4 bytes).
+    let op = *bytes.get(1 + base_len as usize)? 
+    let r = ["B","C","D","E","H","L","(HL)","A"][(op & 7) as usize]
+    let sub = (op >> 3) & 7
+    let cls = op >> 6
+    let reg = if hl == "HL" { r.to_string() } else {
+        let d = bytes[2] as i8
+        format!("({}{:+})", hl, d)
     }
-    Some(Insn { mnemonic: format!("{} {}", mnem, r), len: 2 })
+    let mnem = match cls {
+        0 => {
+            let names = ["RLC","RRC","RL","RR","SLA","SRA","SLL","SRL"]
+            format!("{} {}", names[sub as usize], reg)
+        }
+        1 => format!("BIT {}, {}", sub, reg),
+        2 => format!("RES {}, {}", sub, reg),
+        _ => format!("SET {}, {}", sub, reg),
+    }
+    let len = if hl == "HL" { 2 } else { 4 }
+    Some(Insn { mnemonic: mnem, len })
 }
 
-fn decode_ed(op: &u8) -> Option<Insn> {
-    match op {
-        0x44 => Some(Insn { mnemonic: "NEG".into(), len: 2 }),
-        0x46 => Some(Insn { mnemonic: "IM 0".into(), len: 2 }),
-        0x56 => Some(Insn { mnemonic: "IM 1".into(), len: 2 }),
-        0x5E => Some(Insn { mnemonic: "IM 2".into(), len: 2 }),
-        0xB0 => Some(Insn { mnemonic: "LDIR".into(), len: 2 }),
-        _    => Some(Insn { mnemonic: format!(".db 0xED, 0x{:02X}", op), len: 2 }),
+// ─── ED prefix: block transfer + misc extended ───────────────────────
+
+fn decode_ed(bytes: &[u8]) -> Option<Insn> {
+    let op = *bytes.get(1)?
+    let len = 2u8
+    let s = match op {
+        0x40 => "IN B, (C)",       0x41 => "OUT (C), B",   0x42 => "SBC HL, BC",
+        0x43 => return Some(Insn { mnemonic: format!("LD (0x{:04X}), BC", u16_le(bytes, 2)), len: 4 }),
+        0x44 => "NEG",             0x45 => "RETN",         0x46 => "IM 0",
+        0x47 => "LD I, A",         0x48 => "IN C, (C)",    0x49 => "OUT (C), C",
+        0x4A => "ADC HL, BC",
+        0x4B => return Some(Insn { mnemonic: format!("LD BC, (0x{:04X})", u16_le(bytes, 2)), len: 4 }),
+        0x4D => "RETI",            0x4F => "LD R, A",
+        0x50 => "IN D, (C)",       0x51 => "OUT (C), D",   0x52 => "SBC HL, DE",
+        0x53 => return Some(Insn { mnemonic: format!("LD (0x{:04X}), DE", u16_le(bytes, 2)), len: 4 }),
+        0x56 => "IM 1",            0x57 => "LD A, I",
+        0x58 => "IN E, (C)",       0x59 => "OUT (C), E",   0x5A => "ADC HL, DE",
+        0x5B => return Some(Insn { mnemonic: format!("LD DE, (0x{:04X})", u16_le(bytes, 2)), len: 4 }),
+        0x5E => "IM 2",            0x5F => "LD A, R",
+        0x60 => "IN H, (C)",       0x61 => "OUT (C), H",   0x62 => "SBC HL, HL",
+        0x67 => "RRD",
+        0x68 => "IN L, (C)",       0x69 => "OUT (C), L",   0x6A => "ADC HL, HL",
+        0x6F => "RLD",
+        0x72 => "SBC HL, SP",
+        0x73 => return Some(Insn { mnemonic: format!("LD (0x{:04X}), SP", u16_le(bytes, 2)), len: 4 }),
+        0x78 => "IN A, (C)",       0x79 => "OUT (C), A",   0x7A => "ADC HL, SP",
+        0x7B => return Some(Insn { mnemonic: format!("LD SP, (0x{:04X})", u16_le(bytes, 2)), len: 4 }),
+        0xA0 => "LDI",  0xA1 => "CPI",  0xA2 => "INI",  0xA3 => "OUTI",
+        0xA8 => "LDD",  0xA9 => "CPD",  0xAA => "IND",  0xAB => "OUTD",
+        0xB0 => "LDIR", 0xB1 => "CPIR", 0xB2 => "INIR", 0xB3 => "OTIR",
+        0xB8 => "LDDR", 0xB9 => "CPDR", 0xBA => "INDR", 0xBB => "OTDR",
+        _ => return Some(Insn { mnemonic: format!(".db 0xED, 0x{:02X}", op), len }),
     }
+    Some(Insn { mnemonic: s.to_string(), len })
 }
 
-fn decode_ix(_b: &[u8], prefix: &str) -> Option<Insn> {
-    Some(Insn { mnemonic: format!("<{}-prefixed>", prefix), len: 2 })
+// ─── DD / FD prefix: same as main map but HL → IX / IY ──────────────
+
+fn decode_ix(bytes: &[u8], prefix: &str) -> Option<Insn> {
+    let op = *bytes.get(1)?
+    if op == 0xCB {
+        // DDCB/FDCB: prefix CB disp op (4 bytes). Displacement is bytes[2].
+        return decode_cb(bytes, prefix, 0)
+    }
+    // Re-decode the trailing opcode with HL-register set swapped to IX/IY.
+    let mut inner = decode_main(op, &bytes[1..], prefix)
+    // (HL) operands become (IX+d)/(IY+d) and grow the instruction by 1.
+    if inner.mnemonic.contains("(HL)") {
+        let d = bytes.get(2).copied().unwrap_or(0) as i8
+        let ixd = format!("({}{:+})", prefix, d)
+        inner.mnemonic = inner.mnemonic.replace("(HL)", &ixd)
+        inner.len += 1
+    }
+    // The prefix byte itself contributes 1 to the total length.
+    inner.len += 1
+    Some(inner)
 }
+
+// ─── helpers ─────────────────────────────────────────────────────────
+
+fn u16_le(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+fn reg_h(hl: &str) -> &'static str { match hl { "IX" => "IXH", "IY" => "IYH", _ => "H" } }
+fn reg_l(hl: &str) -> &'static str { match hl { "IX" => "IXL", "IY" => "IYL", _ => "L" } }
