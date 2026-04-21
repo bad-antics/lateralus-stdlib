@@ -1,0 +1,45 @@
+// stdlib/geo/wgs84.ltl — WGS84 geodetic ↔ ECEF conversion.
+//
+// WGS84 is an oblate ellipsoid: semi-major a=6378137 m, flattening
+// f=1/298.257223563. Converts between geodetic (lat, lon, alt) and
+// Earth-Centered Earth-Fixed (X, Y, Z) meters. Used in GPS receivers
+// as the native frame before projecting to a local tangent plane.
+
+pub const A: f64 = 6_378_137.0
+pub const F: f64 = 1.0 / 298.257_223_563
+pub const B: f64 = A * (1.0 - F)
+pub const E2: f64 = F * (2.0 - F)           // first eccentricity squared
+pub const EP2: f64 = E2 / (1.0 - E2)         // second eccentricity squared
+
+pub fn geodetic_to_ecef(lat_deg: f64, lon_deg: f64, alt_m: f64) -> (f64, f64, f64) {
+    let lat = lat_deg.to_radians(); let lon = lon_deg.to_radians()
+    let n = A / (1.0 - E2 * lat.sin().powi(2)).sqrt()
+    let x = (n + alt_m) * lat.cos() * lon.cos()
+    let y = (n + alt_m) * lat.cos() * lon.sin()
+    let z = (n * (1.0 - E2) + alt_m) * lat.sin()
+    (x, y, z)
+}
+
+pub fn ecef_to_geodetic(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+    // Bowring's closed-form approximation — accurate to centimeters for
+    // practical altitudes without iteration.
+    let p = (x * x + y * y).sqrt()
+    let theta = (z * A).atan2(p * B)
+    let lon = y.atan2(x)
+    let num = z + EP2 * B * theta.sin().powi(3)
+    let den = p - E2 * A * theta.cos().powi(3)
+    let lat = num.atan2(den)
+    let n = A / (1.0 - E2 * lat.sin().powi(2)).sqrt()
+    let alt = p / lat.cos() - n
+    (lat.to_degrees(), lon.to_degrees(), alt)
+}
+
+pub fn meridional_radius(lat_deg: f64) -> f64 {
+    let s = lat_deg.to_radians().sin()
+    A * (1.0 - E2) / (1.0 - E2 * s * s).powf(1.5)
+}
+
+pub fn prime_vertical_radius(lat_deg: f64) -> f64 {
+    let s = lat_deg.to_radians().sin()
+    A / (1.0 - E2 * s * s).sqrt()
+}
