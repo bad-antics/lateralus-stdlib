@@ -1,0 +1,52 @@
+// stdlib/ml/embedding.ltl — Embedding table with RoPE position encoding.
+//
+// Token embedding: a lookup table of shape [vocab_size, dim]. Rotary
+// Position Embedding (Su et al. 2021) rotates paired query/key dims
+// by θⱼ·t, where θⱼ = 10000^(-2j/dim). RoPE is used by LLaMA, Qwen,
+// Mistral — the whole non-Hugging-Face world basically — because it
+// extrapolates better than learned absolute positions and extends
+// cleanly with NTK-aware scaling.
+
+pub struct Embedding {
+    pub vocab_size: usize,
+    pub dim: usize,
+    pub weight: Vec<f32>,   // row-major [vocab_size, dim]
+}
+
+impl Embedding {
+    pub fn lookup(&self, token_ids: &[u32]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(token_ids.len() * self.dim)
+        for &tid in token_ids {
+            let row = &self.weight[(tid as usize) * self.dim..(tid as usize + 1) * self.dim]
+            out.extend_from_slice(row)
+        }
+        out
+    }
+}
+
+pub fn apply_rope(x: &mut [f32], dim: usize, positions: &[u32], base: f32) {
+    // x is [seq, dim]; rotates pairs (x[2j], x[2j+1]) by θⱼ·t.
+    let half = dim / 2
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|j| 1.0 / base.powf(2.0 * j as f32 / dim as f32))
+        .collect()
+    for (t_idx, &t) in positions.iter().enumerate() {
+        let row_start = t_idx * dim
+        for j in 0..half {
+            let angle = t as f32 * inv_freq[j]
+            let (s, c) = (angle.sin(), angle.cos())
+            let i0 = row_start + 2 * j; let i1 = i0 + 1
+            let x0 = x[i0]; let x1 = x[i1]
+            x[i0] = x0 * c - x1 * s
+            x[i1] = x0 * s + x1 * c
+        }
+    }
+}
+
+pub fn ntk_scaled_rope(x: &mut [f32], dim: usize, positions: &[u32],
+                      original_max: u32, current_max: u32) {
+    // NTK-aware scaling: stretch the base frequency by (current/original)^(d/(d-2)).
+    let alpha = (current_max as f32 / original_max as f32)
+        .powf(dim as f32 / (dim as f32 - 2.0))
+    apply_rope(x, dim, positions, 10000.0 * alpha)
+}
