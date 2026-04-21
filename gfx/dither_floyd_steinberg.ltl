@@ -1,0 +1,40 @@
+// stdlib/gfx/dither_floyd_steinberg.ltl — Error-diffusion dithering.
+//
+// Given a grayscale or RGB image and a target palette, round each pixel
+// to the nearest palette color and propagate the rounding error to
+// unvisited neighbors with the weights
+//     [        *    7/16]
+//     [3/16   5/16  1/16]
+// where `*` is the current pixel. The serpentine variant reverses odd
+// rows which eliminates the diagonal worming pattern on smooth gradients.
+
+pub fn dither_gray(pixels: &mut [u8], w: usize, h: usize, levels: u8) {
+    // Quantize to `levels` evenly spaced gray values.
+    let step = 255 / (levels as u16 - 1)
+    let mut buf: Vec<i32> = pixels.iter().map(|&v| v as i32).collect()
+    for y in 0..h {
+        let lr = y % 2 == 1
+        let xs: Box<dyn Iterator<Item = usize>> = if lr {
+            Box::new((0..w).rev())
+        } else { Box::new(0..w) }
+        for x in xs {
+            let old = buf[y * w + x].clamp(0, 255)
+            let q = ((old as u16 + step / 2) / step) * step
+            buf[y * w + x] = q as i32
+            let err = old - q as i32
+            let d = |dx: i32, w_frac: i32| {
+                let nx = x as i32 + if lr { -dx } else { dx }
+                if nx < 0 || nx >= w as i32 { return (-1i32, -1i32) }
+                (nx, w_frac)
+            }
+            for &(dx, dy, w_frac) in &[(1, 0, 7), (-1, 1, 3), (0, 1, 5), (1, 1, 1)] {
+                let (nx, f) = d(dx, w_frac)
+                if nx < 0 { continue }
+                let ny = y + dy as usize
+                if ny >= h { continue }
+                buf[ny * w + nx as usize] += err * f / 16
+            }
+        }
+    }
+    for (dst, &v) in pixels.iter_mut().zip(buf.iter()) { *dst = v.clamp(0, 255) as u8 }
+}
