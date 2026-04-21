@@ -1,0 +1,54 @@
+// stdlib/net/mqtt.ltl — MQTT 3.1.1 fixed header + CONNECT/PUBLISH codec.
+//
+// MQTT packets start with a byte carrying type(4) and flags(4), then a
+// variable-length "Remaining Length" (1-4 bytes, 7 bits each with high
+// bit as continuation), then the variable header + payload. We cover
+// CONNECT, CONNACK, PUBLISH, SUBSCRIBE; enough for a minimal client or
+// broker test fixture.
+
+pub enum PacketType { Connect = 1, Connack, Publish, Puback, Pubrec, Pubrel, Pubcomp,
+    Subscribe, Suback, Unsubscribe, Unsuback, Pingreq, Pingresp, Disconnect }
+
+pub struct FixedHeader { pub type_: u8, pub flags: u8, pub remaining: usize }
+
+pub fn encode_remaining_length(n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4)
+    let mut n = n
+    loop {
+        let mut b = (n & 0x7F) as u8; n >>= 7
+        if n > 0 { b |= 0x80 }
+        out.push(b)
+        if n == 0 { return out }
+    }
+}
+
+pub fn decode_remaining_length(bytes: &[u8]) -> Result<(usize, usize), &'static str> {
+    let mut multiplier = 1; let mut value = 0usize; let mut i = 0
+    loop {
+        if i >= bytes.len() || i >= 4 { return Err("malformed length") }
+        let b = bytes[i]; i += 1
+        value += (b & 0x7F) as usize * multiplier
+        if multiplier > 128 * 128 * 128 { return Err("length overflow") }
+        if b & 0x80 == 0 { return Ok((value, i)) }
+        multiplier *= 128
+    }
+}
+
+pub fn parse_fixed_header(bytes: &[u8]) -> Result<(FixedHeader, usize), &'static str> {
+    if bytes.is_empty() { return Err("empty") }
+    let (remaining, n) = decode_remaining_length(&bytes[1..])?
+    Ok((FixedHeader { type_: bytes[0] >> 4, flags: bytes[0] & 0x0F, remaining }, 1 + n))
+}
+
+pub fn encode_publish(topic: &str, payload: &[u8], qos: u8, packet_id: u16) -> Vec<u8> {
+    let mut vh = Vec::new()
+    vh.extend_from_slice(&(topic.len() as u16).to_be_bytes())
+    vh.extend_from_slice(topic.as_bytes())
+    if qos > 0 { vh.extend_from_slice(&packet_id.to_be_bytes()) }
+    vh.extend_from_slice(payload)
+    let mut out = Vec::with_capacity(2 + vh.len())
+    out.push(((PacketType::Publish as u8) << 4) | ((qos & 0x03) << 1))
+    out.extend_from_slice(&encode_remaining_length(vh.len()))
+    out.extend_from_slice(&vh)
+    out
+}
