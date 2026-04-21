@@ -1,0 +1,56 @@
+// stdlib/sync/semaphore.ltl — Counting semaphore with timed acquire.
+//
+// A counting semaphore is just a non-negative integer with atomic
+// decrement-if-positive (acquire) and increment (release). The classic
+// uses: bounding the number of concurrent DB connections, fair resource
+// pools, and producer/consumer pacing where the count tracks available
+// slots. Priority inversion is avoided by FIFO-waking waiters.
+
+use std::sync::atomic::{AtomicI32, Ordering::*}
+use os::futex::{futex_wait, futex_wake}
+
+pub struct Semaphore { count: AtomicI32 }
+
+impl Semaphore {
+    pub fn new(initial: i32) -> Self {
+        assert!(initial >= 0, "semaphore must start non-negative")
+        Self { count: AtomicI32::new(initial) }
+    }
+    pub fn acquire(&self) {
+        loop {
+            let c = self.count.load(Relaxed)
+            if c > 0 {
+                if self.count.compare_exchange_weak(c, c - 1, Acquire, Relaxed).is_ok() { return }
+            } else {
+                unsafe { futex_wait(self.count.as_mut_ptr() as *const u32, 0, None) }
+            }
+        }
+    }
+    pub fn try_acquire(&self) -> bool {
+        let mut c = self.count.load(Relaxed)
+        while c > 0 {
+            match self.count.compare_exchange_weak(c, c - 1, Acquire, Relaxed) {
+                Ok(_) => return true,
+                Err(v) => c = v,
+            }
+        }
+        false
+    }
+    pub fn acquire_timeout(&self, timeout_ns: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(timeout_ns)
+        loop {
+            if self.try_acquire() { return true }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now())
+            if remaining.is_zero() { return false }
+            unsafe { futex_wait(self.count.as_mut_ptr() as *const u32, 0, Some(remaining.as_nanos() as u64)) }
+        }
+    }
+    pub fn release(&self) {
+        self.count.fetch_add(1, Release)
+        unsafe { futex_wake(self.count.as_mut_ptr() as *const u32, 1) }
+    }
+    pub fn release_n(&self, n: i32) {
+        self.count.fetch_add(n, Release)
+        unsafe { futex_wake(self.count.as_mut_ptr() as *const u32, n as u32) }
+    }
+}
