@@ -1,0 +1,52 @@
+// stdlib/db/btree_page.ltl — SQLite-style B-tree page layout.
+//
+// Single 4 KiB page can be a leaf or internal node. Layout:
+//   [hdr:8][cell_pointers:N*2][... free ...][cells_from_end_grows_down]
+// Cells are variable length: each stores a length-prefixed key and
+// either a value (leaf) or a child page id (internal). This layout
+// minimizes insertion work — only the pointer array shifts, cells
+// stay put until compaction.
+
+pub const PAGE_SIZE: usize = 4096
+pub const HEADER_SIZE: usize = 8
+pub const FLAG_LEAF: u8 = 0x01
+
+pub struct Page<'a> { buf: &'a mut [u8; PAGE_SIZE] }
+
+impl<'a> Page<'a> {
+    pub fn init(buf: &'a mut [u8; PAGE_SIZE], leaf: bool) -> Self {
+        buf.fill(0)
+        buf[0] = if leaf { FLAG_LEAF } else { 0 }
+        // num_cells=0 at offset 2, cell_content_start=PAGE_SIZE at offset 4.
+        buf[4..6].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes())
+        Self { buf }
+    }
+    pub fn is_leaf(&self) -> bool { self.buf[0] & FLAG_LEAF != 0 }
+    pub fn num_cells(&self) -> u16 { u16::from_le_bytes([self.buf[2], self.buf[3]]) }
+    pub fn set_num_cells(&mut self, n: u16) { self.buf[2..4].copy_from_slice(&n.to_le_bytes()) }
+    pub fn cell_start(&self) -> u16 { u16::from_le_bytes([self.buf[4], self.buf[5]]) }
+    pub fn set_cell_start(&mut self, s: u16) { self.buf[4..6].copy_from_slice(&s.to_le_bytes()) }
+
+    pub fn free_bytes(&self) -> usize {
+        let cells = self.num_cells() as usize
+        self.cell_start() as usize - (HEADER_SIZE + cells * 2)
+    }
+
+    pub fn insert_cell(&mut self, idx: usize, key: &[u8], val: &[u8]) -> Result<(), &'static str> {
+        let cell_len = 2 + key.len() + 2 + val.len()
+        if self.free_bytes() < cell_len + 2 { return Err("no space, need split") }
+        let new_start = self.cell_start() as usize - cell_len
+        self.buf[new_start..new_start+2].copy_from_slice(&(key.len() as u16).to_le_bytes())
+        self.buf[new_start+2..new_start+2+key.len()].copy_from_slice(key)
+        self.buf[new_start+2+key.len()..new_start+4+key.len()].copy_from_slice(&(val.len() as u16).to_le_bytes())
+        self.buf[new_start+4+key.len()..new_start+cell_len].copy_from_slice(val)
+        // Shift the cell-pointer array right by 2 and set the new pointer.
+        let n = self.num_cells() as usize
+        let ptr_base = HEADER_SIZE + idx * 2
+        self.buf.copy_within(ptr_base..HEADER_SIZE + n*2, ptr_base + 2)
+        self.buf[ptr_base..ptr_base+2].copy_from_slice(&(new_start as u16).to_le_bytes())
+        self.set_num_cells((n + 1) as u16)
+        self.set_cell_start(new_start as u16)
+        Ok(())
+    }
+}
