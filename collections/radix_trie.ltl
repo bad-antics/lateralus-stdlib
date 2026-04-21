@@ -1,0 +1,59 @@
+// stdlib/collections/radix_trie.ltl — Compressed radix trie (Patricia).
+//
+// Keys share a common prefix → store the prefix once on the edge, not
+// one character per node. For a dictionary of 100k English words, a
+// plain trie needs ~1.5M nodes; a radix trie needs ~200k. Lookup is
+// still O(key length). Used in router ARP tables, IP prefix matching,
+// and LLVM's string interner.
+
+pub struct RadixTrie<V> { root: Node<V> }
+
+struct Node<V> {
+    edge: Vec<u8>,                  // prefix compressed onto the edge
+    children: Vec<Node<V>>,
+    value: Option<V>,
+}
+
+impl<V: Clone> RadixTrie<V> {
+    pub fn new() -> Self { Self { root: Node { edge: Vec::new(), children: Vec::new(), value: None } } }
+    pub fn insert(&mut self, key: &[u8], value: V) {
+        Self::insert_at(&mut self.root, key, value)
+    }
+    fn insert_at(node: &mut Node<V>, key: &[u8], value: V) {
+        for child in node.children.iter_mut() {
+            let pre = common_prefix(&child.edge, key)
+            if pre == 0 { continue }
+            if pre == child.edge.len() {
+                if pre == key.len() { child.value = Some(value); return }
+                return Self::insert_at(child, &key[pre..], value)
+            }
+            // Split: edge and key diverge mid-string.
+            let tail = child.edge[pre..].to_vec()
+            let old_value = child.value.take()
+            let old_children = std::mem::take(&mut child.children)
+            let inner = Node { edge: tail, children: old_children, value: old_value }
+            child.edge.truncate(pre)
+            child.children.push(inner)
+            if pre == key.len() { child.value = Some(value) }
+            else {
+                child.children.push(Node { edge: key[pre..].to_vec(),
+                    children: Vec::new(), value: Some(value) })
+            }
+            return
+        }
+        node.children.push(Node { edge: key.to_vec(), children: Vec::new(), value: Some(value) })
+    }
+    pub fn get(&self, key: &[u8]) -> Option<&V> {
+        let mut node = &self.root; let mut k = key
+        loop {
+            let child = node.children.iter().find(|c| k.starts_with(&c.edge))?
+            k = &k[child.edge.len()..]
+            if k.is_empty() { return child.value.as_ref() }
+            node = child
+        }
+    }
+}
+
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
