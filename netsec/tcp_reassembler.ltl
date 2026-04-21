@@ -1,0 +1,50 @@
+// stdlib/netsec/tcp_reassembler.ltl — TCP stream reassembly for IDS.
+//
+// Given a sequence of TCP segments (possibly out-of-order, with holes
+// and retransmits), reassemble the original byte stream. Keep segments
+// keyed by the 4-tuple (srcip, srcport, dstip, dstport) plus seq; on
+// delivery, emit contiguous prefix bytes starting from the next
+// expected seq and hand them to the application-layer decoder.
+// This is the workhorse of every Zeek/Suricata install.
+
+use std::collections::BTreeMap
+
+pub struct Flow { pub next_seq: u32, pub pending: BTreeMap<u32, Vec<u8>>,
+    pub max_gap_bytes: usize }
+
+pub enum PushResult { Delivered(Vec<u8>), Buffered, Overlap, Duplicate }
+
+impl Flow {
+    pub fn new(initial_seq: u32) -> Self {
+        Self { next_seq: initial_seq, pending: BTreeMap::new(), max_gap_bytes: 1 << 20 }
+    }
+    pub fn push(&mut self, seq: u32, data: &[u8]) -> PushResult {
+        if data.is_empty() { return PushResult::Duplicate }
+        // All comparisons mod 2^32 to handle sequence wrap; we use seq_le.
+        if seq_lt(seq + data.len() as u32, self.next_seq.wrapping_add(1)) {
+            return PushResult::Duplicate
+        }
+        if seq == self.next_seq {
+            self.next_seq = self.next_seq.wrapping_add(data.len() as u32)
+            let mut out = data.to_vec()
+            while let Some((&first_seq, _)) = self.pending.iter().next() {
+                if first_seq != self.next_seq { break }
+                let (_, chunk) = self.pending.pop_first().unwrap()
+                self.next_seq = self.next_seq.wrapping_add(chunk.len() as u32)
+                out.extend_from_slice(&chunk)
+            }
+            PushResult::Delivered(out)
+        } else if seq_lt(self.next_seq, seq) {
+            self.pending.insert(seq, data.to_vec())
+            // Bound memory — if the gap pile grows too big we drop.
+            if self.pending.values().map(|v| v.len()).sum::<usize>() > self.max_gap_bytes {
+                self.pending.clear()
+            }
+            PushResult::Buffered
+        } else {
+            PushResult::Overlap
+        }
+    }
+}
+
+fn seq_lt(a: u32, b: u32) -> bool { ((a as i32).wrapping_sub(b as i32)) < 0 }
