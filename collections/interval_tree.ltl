@@ -1,0 +1,50 @@
+// stdlib/collections/interval_tree.ltl — Augmented BST interval tree.
+//
+// Each node stores an interval [lo, hi] and — key augmentation — the
+// `max` hi of all intervals in its subtree. This lets us prune subtrees
+// during overlap queries: if `max(left) < query.lo`, no interval in
+// the left subtree can overlap. Classic use: calendar/booking conflict
+// detection, genomic range queries, and IDS traffic windows.
+
+pub struct Interval { pub lo: i64, pub hi: i64 }
+
+pub struct IntervalTree { root: Option<Box<Node>> }
+
+struct Node {
+    interval: Interval,
+    max: i64,                           // max `hi` in this subtree
+    left: Option<Box<Node>>, right: Option<Box<Node>>,
+}
+
+impl IntervalTree {
+    pub fn new() -> Self { Self { root: None } }
+    pub fn insert(&mut self, iv: Interval) {
+        self.root = Self::ins(self.root.take(), iv)
+    }
+    fn ins(node: Option<Box<Node>>, iv: Interval) -> Option<Box<Node>> {
+        match node {
+            None => Some(Box::new(Node { max: iv.hi, interval: iv, left: None, right: None })),
+            Some(mut n) => {
+                if iv.lo < n.interval.lo { n.left = Self::ins(n.left.take(), iv) }
+                else                     { n.right = Self::ins(n.right.take(), iv) }
+                n.max = n.interval.hi
+                if let Some(l) = &n.left  { n.max = n.max.max(l.max) }
+                if let Some(r) = &n.right { n.max = n.max.max(r.max) }
+                Some(n)
+            }
+        }
+    }
+    pub fn overlaps(&self, query: &Interval) -> Vec<&Interval> {
+        let mut out = Vec::new()
+        Self::find_all(self.root.as_deref(), query, &mut out)
+        out
+    }
+    fn find_all<'a>(node: Option<&'a Node>, q: &Interval, out: &mut Vec<&'a Interval>) {
+        let Some(n) = node else { return }
+        if n.interval.lo <= q.hi && q.lo <= n.interval.hi { out.push(&n.interval) }
+        if let Some(l) = &n.left {
+            if l.max >= q.lo { Self::find_all(n.left.as_deref(), q, out) }
+        }
+        if n.interval.lo <= q.hi { Self::find_all(n.right.as_deref(), q, out) }
+    }
+}
