@@ -1,42 +1,175 @@
 // stdlib/time/tzif.ltl — TZif (RFC 8536) time-zone data reader.
 //
 // Every Linux/BSD/macOS ships /usr/share/zoneinfo with binary TZif
-// files. A file starts with "TZif" magic, a version byte, some
-// reserved zeros, and six 32-bit counts (typecnt, leapcnt, etc.), then
-// tables: transition times, transition types, ttinfo structs, abbrev
-// chars, leap-second entries. Version 2+ files append a 64-bit copy
-// of the same tables plus a trailing POSIX TZ string for
-// post-table-range extrapolation.
+// files. A file starts with "TZif" magic, a version byte, 15 reserved
+// zeros, and six 32-bit big-endian counts:
+//   tzh_ttisutcnt  UTC/local indicators
+//   tzh_ttisstdcnt standard/wall indicators
+//   tzh_leapcnt    leap-second records
+//   tzh_timecnt    transition times
+//   tzh_typecnt    local time types
+//   tzh_charcnt    abbrev chars
+// Then the data block. Version 2/3/4 files append a second copy of
+// the header + data block with 64-bit transition times, followed by a
+// newline-wrapped POSIX TZ string used to extrapolate past the last
+// recorded transition.
 
-pub struct Transition { pub at_utc: i64, pub offset_sec: i32, pub is_dst: bool, pub abbrev: String }
-pub struct TzFile { pub transitions: Vec<Transition>, pub posix_tz: String }
+pub struct Ttinfo { pub utoff: i32, pub is_dst: bool, pub abbr_idx: u8 }
 
-pub fn parse(bytes: &[u8]) -> Result<TzFile, &'static str> {
-    if bytes.len() < 44 || &bytes[..4] != b"TZif" { return Err("not TZif") }
-    let (v1, cursor) = parse_block(bytes, 4)?
-    if bytes[4] as char >= '2' {
-        // v2/v3 64-bit block replaces v1.
-        let (v2, _) = parse_block(bytes, cursor)?
-        let posix = bytes[bytes.len() - trailing_nl(bytes) ..].to_vec()
-        let posix_tz = String::from_utf8_lossy(&posix).trim().to_string()
-        return Ok(TzFile { transitions: v2, posix_tz })
-    }
-    Ok(TzFile { transitions: v1, posix_tz: String::new() })
+pub struct Transition {
+    pub at_utc: i64,
+    pub offset_sec: i32,
+    pub is_dst: bool,
+    pub abbrev: String,
 }
 
-fn parse_block(_bytes: &[u8], _cursor: usize) -> Result<(Vec<Transition>, usize), &'static str> {
-    // Full table parsing elided — the shape is:
-    //   [transition_times: N·4 or N·8 bytes][type_indices: N·1]
-    //   [ttinfo[typecnt]: 6 bytes each][abbrev chars][leapsec pairs]
-    //   [std/wall indicators][ut/local indicators]
-    Ok((Vec::new(), _cursor))
+pub struct LeapSecond { pub at_utc: i64, pub correction: i32 }
+
+pub struct TzFile {
+    pub version: u8,
+    pub transitions: Vec<Transition>,
+    pub types: Vec<Ttinfo>,
+    pub leap_seconds: Vec<LeapSecond>,
+    pub posix_tz: String,
+}
+
+struct Counts { ttisutcnt: u32, ttisstdcnt: u32, leapcnt: u32, timecnt: u32, typecnt: u32, charcnt: u32 }
+
+pub fn parse(bytes: &[u8]) -> Result<TzFile, &'static str> {
+    if bytes.len() < 44 || &bytes[..4] != b"TZif" {
+        return Err("not TZif: missing magic")
+    }
+    let version_byte = bytes[4]
+    let version = match version_byte { 0 => 1, b'2' => 2, b'3' => 3, b'4' => 4, _ => return Err("unknown version") }
+
+    // Parse first (32-bit) block.
+    let (block1, cursor1) = parse_block(bytes, 20, false)?
+
+    if version >= 2 {
+        // Version 2+: a second header starts at cursor1 and the data
+        // block uses 64-bit transition times. The first block is
+        // ignored for time lookups; we keep the 64-bit version.
+        if cursor1 + 20 > bytes.len() || &bytes[cursor1..cursor1 + 4] != b"TZif" {
+            return Err("missing v2 header")
+        }
+        let (block2, cursor2) = parse_block(bytes, cursor1 + 20, true)?
+        let posix_tz = parse_posix_tz(&bytes[cursor2..])?
+        return Ok(TzFile {
+            version,
+            transitions: block2.transitions,
+            types: block2.types,
+            leap_seconds: block2.leap_seconds,
+            posix_tz,
+        })
+    }
+
+    Ok(TzFile {
+        version: 1,
+        transitions: block1.transitions,
+        types: block1.types,
+        leap_seconds: block1.leap_seconds,
+        posix_tz: String::new(),
+    })
+}
+
+struct Block { transitions: Vec<Transition>, types: Vec<Ttinfo>, leap_seconds: Vec<LeapSecond> }
+
+fn parse_block(bytes: &[u8], header_at: usize, wide: bool) -> Result<(Block, usize), &'static str> {
+    // Six 32-bit BE counts live at header_at .. header_at + 24.
+    if header_at + 24 > bytes.len() { return Err("truncated header") }
+    let c = Counts {
+        ttisutcnt: be32(&bytes[header_at..]),
+        ttisstdcnt: be32(&bytes[header_at + 4..]),
+        leapcnt:    be32(&bytes[header_at + 8..]),
+        timecnt:    be32(&bytes[header_at + 12..]),
+        typecnt:    be32(&bytes[header_at + 16..]),
+        charcnt:    be32(&bytes[header_at + 20..]),
+    }
+    let time_sz = if wide { 8 } else { 4 }
+    let leap_sz = time_sz + 4
+
+    let mut p = header_at + 24
+
+    // Transition times (big-endian, sorted ascending).
+    let mut times = Vec::with_capacity(c.timecnt as usize)
+    for _ in 0..c.timecnt {
+        if p + time_sz > bytes.len() { return Err("truncated transition times") }
+        let t = if wide { be64(&bytes[p..]) as i64 } else { (be32(&bytes[p..]) as i32) as i64 }
+        times.push(t); p += time_sz
+    }
+
+    // Transition type indices (one u8 per transition).
+    let mut type_idx = Vec::with_capacity(c.timecnt as usize)
+    for _ in 0..c.timecnt {
+        if p >= bytes.len() { return Err("truncated type indices") }
+        type_idx.push(bytes[p]); p += 1
+    }
+
+    // ttinfo records: 4-byte BE utoff (i32), 1-byte isdst (0/1), 1-byte abbrind.
+    let mut types = Vec::with_capacity(c.typecnt as usize)
+    for _ in 0..c.typecnt {
+        if p + 6 > bytes.len() { return Err("truncated ttinfo") }
+        let utoff = be32(&bytes[p..]) as i32
+        let is_dst = bytes[p + 4] != 0
+        let abbr_idx = bytes[p + 5]
+        types.push(Ttinfo { utoff, is_dst, abbr_idx })
+        p += 6
+    }
+
+    // Abbrev chars (NUL-terminated substrings; index is the byte offset).
+    if p + c.charcnt as usize > bytes.len() { return Err("truncated abbrevs") }
+    let abbr_pool = &bytes[p..p + c.charcnt as usize]
+    p += c.charcnt as usize
+
+    // Leap seconds: (time, correction) pairs.
+    let mut leap_seconds = Vec::with_capacity(c.leapcnt as usize)
+    for _ in 0..c.leapcnt {
+        if p + leap_sz > bytes.len() { return Err("truncated leap") }
+        let at_utc = if wide { be64(&bytes[p..]) as i64 } else { (be32(&bytes[p..]) as i32) as i64 }
+        let correction = be32(&bytes[p + time_sz..]) as i32
+        leap_seconds.push(LeapSecond { at_utc, correction })
+        p += leap_sz
+    }
+
+    // std/wall and ut/local indicator arrays — read + advance cursor.
+    if p + (c.ttisstdcnt + c.ttisutcnt) as usize > bytes.len() { return Err("truncated indicators") }
+    p += c.ttisstdcnt as usize
+    p += c.ttisutcnt as usize
+
+    // Materialize transitions with resolved offsets + abbrevs.
+    let mut transitions = Vec::with_capacity(times.len())
+    for (i, at_utc) in times.iter().enumerate() {
+        let ti = type_idx[i] as usize
+        if ti >= types.len() { return Err("bad type index") }
+        let t = &types[ti]
+        let abbrev = read_cstr(abbr_pool, t.abbr_idx as usize)
+        transitions.push(Transition { at_utc: *at_utc, offset_sec: t.utoff, is_dst: t.is_dst, abbrev })
+    }
+
+    Ok((Block { transitions, types, leap_seconds }, p))
+}
+
+fn parse_posix_tz(trailer: &[u8]) -> Result<String, &'static str> {
+    // Format: "\n" <POSIX TZ> "\n". Empty POSIX string ("\n\n") is legal.
+    if trailer.is_empty() { return Ok(String::new()) }
+    if trailer[0] != b'\n' { return Err("missing posix-tz opening newline") }
+    let end = trailer[1..].iter().position(|&b| b == b'\n').ok_or("unterminated posix-tz")?
+    let body = &trailer[1..1 + end]
+    std::str::from_utf8(body).map(|s| s.to_string()).map_err(|_| "posix-tz not utf8")
 }
 
 pub fn find_offset(tz: &TzFile, at_utc: i64) -> Option<&Transition> {
-    // Binary-search the sorted transitions for the one that contains this
-    // instant; the applicable offset is the one from the *previous* entry.
+    // Binary search: the applicable entry is the last one whose at_utc <= target.
+    if tz.transitions.is_empty() { return None }
     let idx = tz.transitions.partition_point(|t| t.at_utc <= at_utc)
-    if idx == 0 { tz.transitions.first() } else { tz.transitions.get(idx - 1) }
+    if idx == 0 { None } else { tz.transitions.get(idx - 1) }
 }
 
-fn trailing_nl(_b: &[u8]) -> usize { 0 }
+fn be32(b: &[u8]) -> u32 { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) }
+fn be64(b: &[u8]) -> u64 { u64::from_be_bytes(b[..8].try_into().unwrap()) }
+
+fn read_cstr(pool: &[u8], offset: usize) -> String {
+    if offset >= pool.len() { return String::new() }
+    let end = pool[offset..].iter().position(|&b| b == 0).unwrap_or(pool.len() - offset)
+    String::from_utf8_lossy(&pool[offset..offset + end]).into_owned()
+}
