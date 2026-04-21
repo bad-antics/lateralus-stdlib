@@ -1,0 +1,63 @@
+// stdlib/db/page_cache.ltl — Clock-Pro-lite buffer pool.
+//
+// Fixed-size pool of PAGE_SIZE buffers. Eviction by Clock-Pro's cold
+// queue: each page has a reference bit; eviction walks the queue and
+// clears bits until it finds a page with reference==0. Simpler than
+// ARC but captures scan-resistance better than plain Clock.
+
+pub const PAGE_SIZE: usize = 4096
+
+pub struct PageId(pub u64)
+
+struct Slot { page_id: Option<PageId>, buf: [u8; PAGE_SIZE],
+    dirty: bool, pin: u32, reference: bool }
+
+pub struct PageCache {
+    slots: Vec<Slot>,
+    map: std::collections::HashMap<u64, usize>,  // page_id -> slot index
+    clock_hand: usize,
+}
+
+impl PageCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            slots: (0..capacity).map(|_| Slot { page_id: None, buf: [0; PAGE_SIZE],
+                dirty: false, pin: 0, reference: false }).collect(),
+            map: std::collections::HashMap::new(),
+            clock_hand: 0,
+        }
+    }
+    pub fn pin(&mut self, id: PageId) -> Option<&mut [u8; PAGE_SIZE]> {
+        if let Some(&idx) = self.map.get(&id.0) {
+            self.slots[idx].reference = true
+            self.slots[idx].pin += 1
+            return Some(&mut self.slots[idx].buf)
+        }
+        let idx = self.evict_victim()?
+        if let Some(old) = self.slots[idx].page_id.take() {
+            self.map.remove(&old.0)
+            if self.slots[idx].dirty { /* writeback */ self.slots[idx].dirty = false }
+        }
+        self.slots[idx].page_id = Some(id); self.slots[idx].pin = 1
+        self.slots[idx].reference = true
+        self.map.insert(id.0, idx)
+        Some(&mut self.slots[idx].buf)
+    }
+    pub fn unpin(&mut self, id: PageId, dirty: bool) {
+        if let Some(&idx) = self.map.get(&id.0) {
+            if self.slots[idx].pin > 0 { self.slots[idx].pin -= 1 }
+            self.slots[idx].dirty |= dirty
+        }
+    }
+    fn evict_victim(&mut self) -> Option<usize> {
+        let n = self.slots.len()
+        for _ in 0..2*n {   // at most 2 full cycles before we give up
+            let i = self.clock_hand
+            self.clock_hand = (self.clock_hand + 1) % n
+            if self.slots[i].pin > 0 { continue }
+            if self.slots[i].reference { self.slots[i].reference = false; continue }
+            return Some(i)
+        }
+        None
+    }
+}
