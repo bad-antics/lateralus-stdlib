@@ -1,0 +1,43 @@
+// stdlib/db/lsm_merge.ltl — LSM k-way merge with tombstones.
+//
+// LevelDB-style compaction: given N sorted SSTable iterators, produce a
+// single sorted output where duplicate keys are resolved by the newest
+// source (by sequence number), and entries marked tombstone are dropped
+// when no older snapshot still needs them. Uses a min-heap keyed on
+// (user_key ASC, seq DESC) for O(log N) per output record.
+
+use std::collections::BinaryHeap
+
+pub struct Entry { pub key: Vec<u8>, pub seq: u64, pub value: Option<Vec<u8>> }
+// value = None means tombstone; Some(_) means put.
+
+pub struct MergeOpts { pub min_snapshot_seq: u64 }
+
+pub fn merge<I: Iterator<Item = Entry>>(mut inputs: Vec<I>, opts: MergeOpts) -> Vec<Entry> {
+    // Heap holds (inverted_key, inverted_seq, input_idx). We invert for
+    // a max-heap to behave as a min-heap on (key ASC, seq DESC).
+    let mut heap: BinaryHeap<(std::cmp::Reverse<Vec<u8>>, u64, usize, Entry)> = BinaryHeap::new()
+    for (i, it) in inputs.iter_mut().enumerate() {
+        if let Some(e) = it.next() {
+            heap.push((std::cmp::Reverse(e.key.clone()), e.seq, i, e))
+        }
+    }
+    let mut out: Vec<Entry> = Vec::new()
+    let mut last_key: Option<Vec<u8>> = None
+    while let Some((_, _, src, entry)) = heap.pop() {
+        // Advance the source we pulled from.
+        if let Some(next) = inputs[src].next() {
+            heap.push((std::cmp::Reverse(next.key.clone()), next.seq, src, next))
+        }
+        // If the same user_key was already emitted (we saw a newer seq),
+        // this older version is garbage unless a snapshot pins it.
+        if last_key.as_deref() == Some(entry.key.as_slice())
+           && entry.seq < opts.min_snapshot_seq { continue }
+        // Drop tombstones older than the oldest snapshot.
+        if entry.value.is_none() && entry.seq < opts.min_snapshot_seq
+           && last_key.as_deref() != Some(entry.key.as_slice()) { continue }
+        last_key = Some(entry.key.clone())
+        out.push(entry)
+    }
+    out
+}
