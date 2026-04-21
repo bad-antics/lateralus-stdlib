@@ -1,0 +1,58 @@
+// stdlib/fs/tar.ltl — POSIX ustar + GNU tar reader.
+//
+// tar is a stream of 512-byte headers each followed by the file contents
+// padded to the next 512-byte boundary. The ustar header has fields in
+// zero-padded octal ASCII, plus a "magic" = "ustar\0" and a 6-byte
+// "version" = "00". GNU extensions add "././@LongLink" records for
+// paths longer than 100 bytes. Two zero blocks at the end terminate
+// the archive.
+
+pub struct Entry<'a> {
+    pub path: String, pub mode: u32, pub size: u64,
+    pub mtime: u64, pub type_: u8, pub linkname: String, pub data: &'a [u8],
+}
+
+pub fn iter(bytes: &[u8]) -> Result<Vec<Entry>, &'static str> {
+    let mut out = Vec::new(); let mut i = 0
+    let mut long_name: Option<String> = None
+    while i + 512 <= bytes.len() {
+        let header = &bytes[i..i + 512]
+        if header.iter().all(|&b| b == 0) { break }  // end marker
+        let size = parse_octal(&header[124..136]).ok_or("bad size")?
+        let type_ = header[156]
+        let mut path = parse_zstr(&header[0..100])
+        // ustar prefix field merges with name if present.
+        if &header[257..263] == b"ustar\0" || &header[257..263] == b"ustar " {
+            let prefix = parse_zstr(&header[345..500])
+            if !prefix.is_empty() && !path.is_empty() { path = format!("{}/{}", prefix, path) }
+        }
+        let data_start = i + 512
+        let data_end = data_start + size as usize
+        if type_ == b'L' {
+            // GNU long-name — the next entry's name is in this data block.
+            long_name = Some(String::from_utf8_lossy(&bytes[data_start..data_end])
+                .trim_end_matches('\0').to_string())
+        } else {
+            let final_path = long_name.take().unwrap_or(path)
+            let mode = parse_octal(&header[100..108]).unwrap_or(0) as u32
+            let mtime = parse_octal(&header[136..148]).unwrap_or(0)
+            let linkname = parse_zstr(&header[157..257])
+            out.push(Entry {
+                path: final_path, mode, size, mtime, type_, linkname,
+                data: &bytes[data_start..data_end]
+            })
+        }
+        let padded = (size + 511) & !511
+        i = data_start + padded as usize
+    }
+    Ok(out)
+}
+
+fn parse_octal(b: &[u8]) -> Option<u64> {
+    let s = std::str::from_utf8(b).ok()?.trim_end_matches(|c: char| c == '\0' || c == ' ').trim()
+    u64::from_str_radix(s, 8).ok()
+}
+fn parse_zstr(b: &[u8]) -> String {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len())
+    String::from_utf8_lossy(&b[..end]).to_string()
+}
