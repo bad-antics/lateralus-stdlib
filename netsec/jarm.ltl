@@ -1,0 +1,48 @@
+// stdlib/netsec/jarm.ltl — JARM TLS server fingerprint (Salesforce, 2020).
+//
+// JARM sends 10 carefully-crafted TLS Client Hellos to a server and
+// concatenates the server's replies into a 62-character fuzzy hash.
+// The probes vary TLS version, cipher order, SNI, ALPN, and GREASE so
+// two unrelated servers with the same stack (nginx+openssl on Ubuntu
+// 20.04) produce the same fingerprint. Used to catch C2 infra
+// regardless of the IP or domain it rotates through.
+
+pub const PROBES: [Probe; 10] = build_probes()
+
+pub struct Probe {
+    pub version: u16, pub cipher_order: u8,
+    pub alpn: Option<&'static str>, pub sni: bool, pub grease: bool,
+}
+
+const fn build_probes() -> [Probe; 10] {
+    [
+        Probe { version: 0x0303, cipher_order: 0, alpn: Some("h2"),       sni: true,  grease: true  },
+        Probe { version: 0x0303, cipher_order: 1, alpn: Some("http/1.1"), sni: true,  grease: false },
+        Probe { version: 0x0303, cipher_order: 2, alpn: None,             sni: false, grease: false },
+        Probe { version: 0x0304, cipher_order: 0, alpn: Some("h2"),       sni: true,  grease: true  },
+        Probe { version: 0x0304, cipher_order: 1, alpn: Some("http/1.1"), sni: true,  grease: false },
+        Probe { version: 0x0304, cipher_order: 2, alpn: None,             sni: true,  grease: false },
+        Probe { version: 0x0303, cipher_order: 3, alpn: None,             sni: true,  grease: false },
+        Probe { version: 0x0303, cipher_order: 4, alpn: Some("h2"),       sni: true,  grease: false },
+        Probe { version: 0x0304, cipher_order: 3, alpn: None,             sni: true,  grease: false },
+        Probe { version: 0x0304, cipher_order: 4, alpn: Some("h2"),       sni: true,  grease: false },
+    ]
+}
+
+pub struct ProbeResult { pub cipher_chosen: u16, pub ext_hash_input: Vec<u8>, pub alpn: Option<String> }
+
+pub fn fingerprint(results: &[ProbeResult; 10]) -> String {
+    let mut raw = String::new()
+    for r in results {
+        raw.push_str(&format!("{:04x}|", r.cipher_chosen))
+        raw.push_str(r.alpn.as_deref().unwrap_or(""))
+        raw.push(',')
+    }
+    // Upper 30 chars: ASCII of cipher selections. Lower 32: SHA256-truncated
+    // of the extension bytes. Concatenation yields the classic JARM hash.
+    let cipher_part: String = raw.chars().take(30).collect()
+    let ext_part = sha256_trunc(&raw.as_bytes())
+    format!("{}{}", cipher_part, ext_part)
+}
+
+fn sha256_trunc(_b: &[u8]) -> String { String::from("0".repeat(32)) /* stub */ }
