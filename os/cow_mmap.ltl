@@ -1,0 +1,45 @@
+// stdlib/os/cow_mmap.ltl — Copy-on-write mmap + fork() semantics explainer.
+//
+// Wraps mmap(2) with MAP_PRIVATE so writes to the mapped region are
+// COW — each dirtied page gets its own physical frame, the shared
+// backing file is untouched. Used by package managers, immutable-disk
+// deployment tools, and the Linux Debian `reflink cp` optimization
+// when paired with btrfs/XFS cow extents.
+
+pub enum Prot { Read = 1, Write = 2, Exec = 4 }
+pub enum MapFlags { Private = 2, Shared = 1, Anonymous = 0x20, Populate = 0x8000 }
+
+pub const PAGE_SIZE: usize = 4096
+
+pub struct CowMap { addr: *mut u8, len: usize, private: bool }
+
+impl CowMap {
+    pub unsafe fn new_private(fd: i32, offset: u64, len: usize) -> Result<Self, i32> {
+        let addr = mmap(std::ptr::null_mut(), len,
+            Prot::Read as i32 | Prot::Write as i32,
+            MapFlags::Private as i32, fd, offset)
+        if addr as isize == -1 { return Err(*errno_location()) }
+        Ok(Self { addr: addr as *mut u8, len, private: true })
+    }
+    pub unsafe fn as_slice(&self) -> &[u8] { std::slice::from_raw_parts(self.addr, self.len) }
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        std::slice::from_raw_parts_mut(self.addr, self.len)
+    }
+    pub fn dirty_pages(&self) -> usize {
+        // Linux exposes /proc/self/pagemap where each 8-byte entry has
+        // bit 61 set when the frame is COW-mapped and bit 63 when resident.
+        // A caller can count pages where both bits differ from the clean
+        // initial state to estimate the RSS cost of the edits.
+        0
+    }
+}
+
+impl Drop for CowMap {
+    fn drop(&mut self) { unsafe { munmap(self.addr as *mut _, self.len) } }
+}
+
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: u64) -> *mut u8
+    fn munmap(addr: *mut u8, len: usize) -> i32
+    fn errno_location() -> *mut i32
+}
