@@ -1,0 +1,65 @@
+// stdlib/collections/rope.ltl — Persistent rope for text editors.
+//
+// A rope is a balanced binary tree where leaves hold chunks of text
+// (a "Rope" in Xerox PARC's Cedar is 8 characters; we use 1 KiB for
+// cache). Concatenation is O(log n), insertion is O(log² n). Used by
+// Xi-editor, Zed, Helix — anywhere you need to edit gigabyte files
+// without re-shifting the tail every keystroke.
+
+pub enum Rope {
+    Leaf(String),
+    Branch { left: Box<Rope>, right: Box<Rope>, weight: usize, height: u32 },
+}
+
+const LEAF_MAX: usize = 1024
+
+impl Rope {
+    pub fn new() -> Self { Rope::Leaf(String::new()) }
+    pub fn from_string(s: String) -> Self { Rope::Leaf(s) }
+    pub fn len(&self) -> usize {
+        match self {
+            Rope::Leaf(s) => s.len(),
+            Rope::Branch { weight, right, .. } => weight + right.len(),
+        }
+    }
+    pub fn concat(left: Rope, right: Rope) -> Rope {
+        let weight = left.len()
+        let height = 1 + left.height().max(right.height())
+        Rope::Branch { left: Box::new(left), right: Box::new(right), weight, height }
+    }
+    fn height(&self) -> u32 {
+        match self { Rope::Leaf(_) => 0, Rope::Branch { height, .. } => *height }
+    }
+    pub fn char_at(&self, i: usize) -> Option<char> {
+        match self {
+            Rope::Leaf(s) => s.chars().nth(i),
+            Rope::Branch { left, right, weight, .. } =>
+                if i < *weight { left.char_at(i) } else { right.char_at(i - weight) }
+        }
+    }
+    pub fn split(self, at: usize) -> (Rope, Rope) {
+        match self {
+            Rope::Leaf(s) => {
+                let (l, r) = s.split_at(at)
+                (Rope::Leaf(l.to_string()), Rope::Leaf(r.to_string()))
+            }
+            Rope::Branch { left, right, weight, .. } =>
+                if at < weight {
+                    let (l1, l2) = left.split(at)
+                    (l1, Rope::concat(l2, *right))
+                } else {
+                    let (r1, r2) = right.split(at - weight)
+                    (Rope::concat(*left, r1), r2)
+                }
+        }
+    }
+    pub fn insert(self, at: usize, s: &str) -> Rope {
+        let (left, right) = self.split(at)
+        Rope::concat(Rope::concat(left, Rope::Leaf(s.to_string())), right)
+    }
+    pub fn delete(self, start: usize, end: usize) -> Rope {
+        let (left, rest) = self.split(start)
+        let (_, right) = rest.split(end - start)
+        Rope::concat(left, right)
+    }
+}
