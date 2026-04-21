@@ -1,0 +1,47 @@
+// stdlib/ml/cross_entropy.ltl — Cross-entropy loss with label smoothing.
+//
+// CE loss over logits, fused with softmax to skip the intermediate
+// probability array:
+//     L = -log softmax(logits)[target]
+//        = log-sum-exp(logits) - logits[target]
+// Label smoothing replaces the hard one-hot target with
+// (1 - ε)·one_hot + ε/K, which regularizes against overconfidence
+// (Szegedy et al. 2016 Inception v3). Typical ε for LLMs: 0.1.
+
+pub fn ce_loss(logits: &[f32], target: usize) -> f32 {
+    let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    let lse = m + logits.iter().map(|&x| (x - m).exp()).sum::<f32>().ln()
+    lse - logits[target]
+}
+
+pub fn ce_loss_batch(logits: &[f32], targets: &[usize], vocab: usize) -> f32 {
+    let mut sum = 0f32
+    for (i, &t) in targets.iter().enumerate() {
+        sum += ce_loss(&logits[i * vocab..(i + 1) * vocab], t)
+    }
+    sum / targets.len() as f32
+}
+
+pub fn ce_loss_smoothed(logits: &[f32], target: usize, epsilon: f32) -> f32 {
+    let k = logits.len() as f32
+    let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    let lse = m + logits.iter().map(|&x| (x - m).exp()).sum::<f32>().ln()
+    let log_p_target = logits[target] - lse
+    // With smoothing: L = -(1-ε)·log p_target - ε/K · Σ log p_i
+    let sum_log_p: f32 = logits.iter().map(|&x| x - lse).sum()
+    -((1.0 - epsilon) * log_p_target + epsilon * sum_log_p / k)
+}
+
+pub fn grad_logits(logits: &[f32], target: usize) -> Vec<f32> {
+    // ∂L/∂logits = softmax(logits) - one_hot(target)
+    let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    let exps: Vec<f32> = logits.iter().map(|&x| (x - m).exp()).collect()
+    let sum: f32 = exps.iter().sum()
+    let mut grad: Vec<f32> = exps.into_iter().map(|e| e / sum).collect()
+    grad[target] -= 1.0
+    grad
+}
+
+pub fn perplexity(nll_sum: f32, token_count: usize) -> f32 {
+    (nll_sum / token_count as f32).exp()
+}
