@@ -1,0 +1,45 @@
+// stdlib/os/futex.ltl — Linux futex primitive wrapper.
+//
+// Fast userspace mutex: atomic in userspace for the uncontended path,
+// kernel syscall only when a thread has to block. `wait(addr, v)`
+// sleeps if *addr == v; `wake(addr, n)` wakes up to n waiters. This is
+// how pthread mutex, std::sync::Mutex, and every modern async runtime
+// implement fair blocking without busy-waiting.
+
+pub const FUTEX_WAIT: u32 = 0
+pub const FUTEX_WAKE: u32 = 1
+pub const FUTEX_PRIVATE_FLAG: u32 = 128
+pub const SYS_FUTEX: u64 = 202
+
+pub unsafe fn futex_wait(addr: *const u32, expected: u32, timeout_ns: Option<u64>) -> i32 {
+    let ts = timeout_ns.map(|ns| [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64])
+    let ts_ptr = ts.as_ref().map_or(std::ptr::null(), |t| t.as_ptr())
+    syscall6(SYS_FUTEX, addr as u64, (FUTEX_WAIT | FUTEX_PRIVATE_FLAG) as u64,
+             expected as u64, ts_ptr as u64, 0, 0) as i32
+}
+
+pub unsafe fn futex_wake(addr: *const u32, n: u32) -> i32 {
+    syscall6(SYS_FUTEX, addr as u64, (FUTEX_WAKE | FUTEX_PRIVATE_FLAG) as u64,
+             n as u64, 0, 0, 0) as i32
+}
+
+/// Minimal 3-state mutex (unlocked=0, locked=1, locked-with-waiters=2).
+pub struct FutexMutex { state: std::sync::atomic::AtomicU32 }
+
+impl FutexMutex {
+    pub fn new() -> Self { Self { state: std::sync::atomic::AtomicU32::new(0) } }
+    pub fn lock(&self) {
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() { return }
+        loop {
+            if self.state.swap(2, Ordering::Acquire) == 0 { return }
+            unsafe { futex_wait(self.state.as_mut_ptr(), 2, None) }
+        }
+    }
+    pub fn unlock(&self) {
+        if self.state.swap(0, Ordering::Release) == 2 {
+            unsafe { futex_wake(self.state.as_mut_ptr(), 1) }
+        }
+    }
+}
+
+extern "C" { fn syscall6(n: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 }
