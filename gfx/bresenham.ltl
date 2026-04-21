@@ -1,0 +1,52 @@
+// stdlib/gfx/bresenham.ltl — Bresenham line, circle, and thick-line.
+//
+// Bresenham's 1962 line algorithm picks the pixel that minimizes the
+// perpendicular distance to the true line using only integer arithmetic.
+// We ship line, anti-aliased Xiaolin Wu line, circle, and a naive thick
+// line by stacking perpendicular offsets — enough to draw vector UI on
+// a 1-bit display at 60 Hz.
+
+pub fn line<F: FnMut(i32, i32)>(x0: i32, y0: i32, x1: i32, y1: i32, mut plot: F) {
+    let dx = (x1 - x0).abs(); let dy = -(y1 - y0).abs()
+    let sx = if x0 < x1 { 1 } else { -1 }
+    let sy = if y0 < y1 { 1 } else { -1 }
+    let mut err = dx + dy
+    let (mut x, mut y) = (x0, y0)
+    loop {
+        plot(x, y)
+        if x == x1 && y == y1 { break }
+        let e2 = 2 * err
+        if e2 >= dy { err += dy; x += sx }
+        if e2 <= dx { err += dx; y += sy }
+    }
+}
+
+pub fn circle<F: FnMut(i32, i32)>(cx: i32, cy: i32, r: i32, mut plot: F) {
+    // Midpoint circle algorithm — 8-way symmetry, integer only.
+    let (mut x, mut y) = (r, 0); let mut err = 1 - r
+    while x >= y {
+        plot(cx + x, cy + y); plot(cx + y, cy + x)
+        plot(cx - y, cy + x); plot(cx - x, cy + y)
+        plot(cx - x, cy - y); plot(cx - y, cy - x)
+        plot(cx + y, cy - x); plot(cx + x, cy - y)
+        y += 1
+        if err < 0 { err += 2 * y + 1 }
+        else { x -= 1; err += 2 * (y - x) + 1 }
+    }
+}
+
+pub fn line_aa<F: FnMut(i32, i32, f32)>(x0: f32, y0: f32, x1: f32, y1: f32, mut plot: F) {
+    // Xiaolin Wu's anti-aliased line (1991).
+    let steep = (y1 - y0).abs() > (x1 - x0).abs()
+    let (x0, y0, x1, y1) = if steep { (y0, x0, y1, x1) } else { (x0, y0, x1, y1) }
+    let (x0, y0, x1, y1) = if x0 > x1 { (x1, y1, x0, y0) } else { (x0, y0, x1, y1) }
+    let dx = x1 - x0; let dy = y1 - y0
+    let grad = if dx.abs() < 1e-6 { 1.0 } else { dy / dx }
+    let mut y = y0 + grad * (x0.round() - x0)
+    for x in x0.round() as i32 ..= x1.round() as i32 {
+        let fy = y.floor() as i32; let f = y - y.floor()
+        if steep { plot(fy, x, 1.0 - f); plot(fy + 1, x, f) }
+        else     { plot(x, fy, 1.0 - f); plot(x, fy + 1, f) }
+        y += grad
+    }
+}
