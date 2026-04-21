@@ -1,0 +1,44 @@
+// stdlib/sync/countdown_latch.ltl — One-shot countdown latch.
+//
+// Differs from a barrier: fires once and never resets. `count_down()`
+// decrements an atomic counter; `wait()` blocks until the counter hits
+// zero. Classic use case: main thread spins up N workers initialized
+// in parallel, calls `wait()` to block until all report ready, then
+// releases the go signal. Also the primitive for Go's sync.WaitGroup.
+
+use std::sync::atomic::{AtomicU32, Ordering::*}
+use os::futex::{futex_wait, futex_wake}
+
+pub struct CountDownLatch { remaining: AtomicU32 }
+
+impl CountDownLatch {
+    pub fn new(count: u32) -> Self { Self { remaining: AtomicU32::new(count) } }
+    pub fn count_down(&self) {
+        let prev = self.remaining.fetch_sub(1, Release)
+        if prev == 1 {
+            // We brought it to zero — wake all waiters.
+            unsafe { futex_wake(self.remaining.as_mut_ptr(), u32::MAX) }
+        } else if prev == 0 {
+            // Underflow — restore to prevent wrap-around to 2^32-1.
+            self.remaining.store(0, Relaxed)
+        }
+    }
+    pub fn wait(&self) {
+        loop {
+            let r = self.remaining.load(Acquire)
+            if r == 0 { return }
+            unsafe { futex_wait(self.remaining.as_mut_ptr(), r, None) }
+        }
+    }
+    pub fn wait_timeout(&self, timeout_ns: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(timeout_ns)
+        loop {
+            let r = self.remaining.load(Acquire)
+            if r == 0 { return true }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now())
+            if remaining.is_zero() { return false }
+            unsafe { futex_wait(self.remaining.as_mut_ptr(), r, Some(remaining.as_nanos() as u64)) }
+        }
+    }
+    pub fn count(&self) -> u32 { self.remaining.load(Acquire) }
+}
