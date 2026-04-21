@@ -1,0 +1,54 @@
+// stdlib/net/coap.ltl — CoAP (RFC 7252) message codec.
+//
+// Constrained Application Protocol — an HTTP-like REST protocol for
+// IoT over UDP. 4-byte fixed header: [ver(2)|type(2)|tkl(4)][code(8)]
+// [msg_id(16)], followed by a token, then TLV-encoded options sorted
+// by number, a 0xFF marker, and the payload. Option numbers use delta
+// encoding for compactness.
+
+pub enum Type { Con = 0, Non = 1, Ack = 2, Rst = 3 }
+pub struct Message<'a> {
+    pub type_: Type, pub code: u8, pub msg_id: u16,
+    pub token: &'a [u8], pub options: Vec<(u16, &'a [u8])>, pub payload: &'a [u8],
+}
+
+pub fn decode(bytes: &[u8]) -> Result<Message, &'static str> {
+    if bytes.len() < 4 || (bytes[0] >> 6) != 1 { return Err("bad CoAP header") }
+    let type_ = match (bytes[0] >> 4) & 0x03 {
+        0 => Type::Con, 1 => Type::Non, 2 => Type::Ack, _ => Type::Rst
+    }
+    let tkl = (bytes[0] & 0x0F) as usize
+    let code = bytes[1]
+    let msg_id = u16::from_be_bytes([bytes[2], bytes[3]])
+    let token = &bytes[4..4 + tkl]
+    let mut i = 4 + tkl; let mut opt_num = 0u16
+    let mut options: Vec<(u16, &[u8])> = Vec::new()
+    let mut payload: &[u8] = &[]
+    while i < bytes.len() {
+        if bytes[i] == 0xFF { payload = &bytes[i + 1..]; break }
+        let delta = (bytes[i] >> 4) as u16; let length = (bytes[i] & 0x0F) as u16
+        i += 1
+        let d = read_extended(bytes, &mut i, delta)?
+        let l = read_extended(bytes, &mut i, length)? as usize
+        opt_num += d
+        options.push((opt_num, &bytes[i..i + l]))
+        i += l
+    }
+    Ok(Message { type_, code, msg_id, token, options, payload })
+}
+
+fn read_extended(bytes: &[u8], i: &mut usize, nibble: u16) -> Result<u16, &'static str> {
+    match nibble {
+        0..=12 => Ok(nibble),
+        13     => { let v = bytes[*i] as u16 + 13; *i += 1; Ok(v) }
+        14     => { let v = u16::from_be_bytes([bytes[*i], bytes[*i+1]]) + 269; *i += 2; Ok(v) }
+        _      => Err("payload marker not allowed here"),
+    }
+}
+
+pub fn method_name(code: u8) -> &'static str {
+    match code {
+        0x01 => "GET", 0x02 => "POST", 0x03 => "PUT", 0x04 => "DELETE",
+        _ => "unknown",
+    }
+}
