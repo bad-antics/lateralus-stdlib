@@ -1,0 +1,57 @@
+// stdlib/db/wal.ltl — Write-Ahead Log with checksummed records.
+//
+// Each record is framed:
+//   [length: u32 LE][crc32: u32 LE][payload]
+// On open, we scan from the start replaying records until we hit a
+// length-zero footer or a CRC mismatch (which indicates a torn write at
+// the crash point). Fsync policy is pluggable via `SyncPolicy`.
+
+use hash::crc32
+use io
+
+pub enum SyncPolicy { None, EveryWrite, EveryN(u32), IntervalMs(u32) }
+
+pub struct Wal { file: io::File, sync: SyncPolicy, writes_since_sync: u32 }
+
+impl Wal {
+    pub fn open(path: &str, sync: SyncPolicy) -> Result<Self, io::Error> {
+        let file = io::File::open_append(path)?
+        Ok(Self { file, sync, writes_since_sync: 0 })
+    }
+    pub fn append(&mut self, payload: &[u8]) -> Result<u64, io::Error> {
+        let mut hdr = [0u8; 8]
+        hdr[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes())
+        hdr[4..8].copy_from_slice(&crc32::hash(payload).to_le_bytes())
+        let offset = self.file.position()?
+        self.file.write_all(&hdr)?; self.file.write_all(payload)?
+        self.writes_since_sync += 1
+        if self.should_sync() { self.file.fsync()?; self.writes_since_sync = 0 }
+        Ok(offset)
+    }
+    fn should_sync(&self) -> bool {
+        match self.sync {
+            SyncPolicy::None => false,
+            SyncPolicy::EveryWrite => true,
+            SyncPolicy::EveryN(n) => self.writes_since_sync >= n,
+            SyncPolicy::IntervalMs(_) => false,  // driven externally
+        }
+    }
+}
+
+pub fn replay<F: FnMut(u64, &[u8])>(path: &str, mut f: F) -> Result<u64, io::Error> {
+    let bytes = io::read_file(path)?
+    let mut i = 0u64
+    while (i as usize) + 8 <= bytes.len() {
+        let off = i
+        let len = u32::from_le_bytes(bytes[i as usize..(i+4) as usize].try_into().unwrap())
+        let crc = u32::from_le_bytes(bytes[(i+4) as usize..(i+8) as usize].try_into().unwrap())
+        i += 8
+        if len == 0 { break }
+        if (i as usize) + (len as usize) > bytes.len() { break }  // torn write
+        let payload = &bytes[i as usize..(i + len as u64) as usize]
+        if crc32::hash(payload) != crc { break }                  // torn/corrupt
+        f(off, payload)
+        i += len as u64
+    }
+    Ok(i)
+}
