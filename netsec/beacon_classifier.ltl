@@ -1,0 +1,49 @@
+// stdlib/netsec/beacon_classifier.ltl — Periodic-beacon traffic classifier.
+//
+// Command-and-control beacons call home on a regular interval with
+// optional jitter. Detection: bucket a client's connection timestamps
+// by destination, compute the coefficient of variation of the inter-
+// arrival intervals, and flag the destination if CV < 0.2 (tight
+// periodicity) and the sample count exceeds 10. Cobalt Strike and
+// Metasploit default profiles both trip this at their out-of-the-box
+// sleep settings.
+
+pub struct BeaconStats {
+    pub count: u32, pub mean: f32, pub stddev: f32, pub cv: f32,
+    pub suspected: bool, pub suggested_interval_sec: f32,
+}
+
+pub fn analyze(timestamps_sec: &[f64]) -> BeaconStats {
+    if timestamps_sec.len() < 2 {
+        return BeaconStats { count: 0, mean: 0.0, stddev: 0.0, cv: 0.0,
+            suspected: false, suggested_interval_sec: 0.0 }
+    }
+    let mut sorted = timestamps_sec.to_vec()
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap())
+    let diffs: Vec<f32> = sorted.windows(2).map(|w| (w[1] - w[0]) as f32).collect()
+    let mean: f32 = diffs.iter().sum::<f32>() / diffs.len() as f32
+    let var: f32 = diffs.iter().map(|d| (d - mean).powi(2)).sum::<f32>() / diffs.len() as f32
+    let stddev = var.sqrt()
+    let cv = if mean > 0.0 { stddev / mean } else { f32::INFINITY }
+    let suspected = diffs.len() >= 10 && cv < 0.20
+    BeaconStats { count: diffs.len() as u32, mean, stddev, cv, suspected,
+        suggested_interval_sec: mean }
+}
+
+/// Find candidate jitter window by FFT autocorrelation — if there's a
+/// peak at lag L separate from lag 0, the beacon interval is likely L.
+pub fn autocorrelation_peak(intervals: &[f32]) -> Option<(usize, f32)> {
+    let n = intervals.len()
+    if n < 20 { return None }
+    let mean: f32 = intervals.iter().sum::<f32>() / n as f32
+    let centered: Vec<f32> = intervals.iter().map(|x| x - mean).collect()
+    let variance: f32 = centered.iter().map(|x| x * x).sum()
+    let mut best = (0usize, 0.0f32)
+    for lag in 1..n / 2 {
+        let mut acc = 0f32
+        for i in 0..n - lag { acc += centered[i] * centered[i + lag] }
+        let r = acc / variance
+        if r > best.1 { best = (lag, r) }
+    }
+    Some(best)
+}
