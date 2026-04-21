@@ -1,0 +1,58 @@
+// stdlib/ml/int8_quant.ltl — Linear int8 quantization (LLM.int8 style).
+//
+// Per-channel symmetric quantization: for each output row find the
+// absolute max, store it as a fp32 scale, and round values to int8
+// in [-127, 127]. Dequantization multiplies by the scale. Memory goes
+// from 4 bytes/weight to 1.25 bytes (int8 + scale amortized).
+//
+// Extension (vectorwise / outlier split): detect outliers in the input
+// activations (columns with abs > threshold) and keep those columns in
+// fp16 matmul, quantize the rest. This is what makes 175B models
+// inference-efficient on a single A100.
+
+pub struct Quantized { pub data: Vec<i8>, pub scales: Vec<f32>, pub rows: usize, pub cols: usize }
+
+pub fn quantize_rowwise(w: &[f32], rows: usize, cols: usize) -> Quantized {
+    let mut data = vec![0i8; w.len()]
+    let mut scales = vec![0f32; rows]
+    for r in 0..rows {
+        let row = &w[r * cols..(r + 1) * cols]
+        let absmax = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-8)
+        let scale = absmax / 127.0
+        scales[r] = scale
+        let inv = 1.0 / scale
+        for (i, &v) in row.iter().enumerate() {
+            data[r * cols + i] = (v * inv).round().clamp(-127.0, 127.0) as i8
+        }
+    }
+    Quantized { data, scales, rows, cols }
+}
+
+pub fn dequantize(q: &Quantized) -> Vec<f32> {
+    let mut out = vec![0f32; q.rows * q.cols]
+    for r in 0..q.rows {
+        let s = q.scales[r]
+        for c in 0..q.cols {
+            out[r * q.cols + c] = q.data[r * q.cols + c] as f32 * s
+        }
+    }
+    out
+}
+
+pub fn matmul_int8_fp32_input(q: &Quantized, x: &[f32]) -> Vec<f32> {
+    // y = W·x where W is int8 per-row, x is fp32. Accumulate in i32 per-row,
+    // multiply by the row scale at the end.
+    let mut y = vec![0f32; q.rows]
+    for r in 0..q.rows {
+        let mut acc = 0f64
+        for c in 0..q.cols {
+            acc += q.data[r * q.cols + c] as f64 * x[c] as f64
+        }
+        y[r] = (acc as f32) * q.scales[r]
+    }
+    y
+}
+
+pub fn outlier_mask(x: &[f32], threshold: f32) -> Vec<bool> {
+    x.iter().map(|&v| v.abs() > threshold).collect()
+}
