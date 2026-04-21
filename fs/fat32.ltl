@@ -1,0 +1,56 @@
+// stdlib/fs/fat32.ltl — FAT32 BPB parser + FAT cluster chain walk.
+//
+// The simplest filesystem the modern world still uses. Layout:
+//   [BPB][reserved][FAT #1][FAT #2][root dir][data clusters]
+// Each cluster entry is 32 bits in the FAT — 28 used, top 4 reserved.
+// A value ≥ 0x0FFFFFF8 means end-of-chain; 0 means free. Walking the
+// chain from first_cluster lets us read a file's data clusters in order.
+
+pub struct Bpb {
+    pub bytes_per_sector: u16,
+    pub sectors_per_cluster: u8,
+    pub reserved_sectors: u16,
+    pub fat_count: u8,
+    pub total_sectors: u32,
+    pub sectors_per_fat: u32,
+    pub root_cluster: u32,
+    pub fat_start_sector: u32,
+    pub data_start_sector: u32,
+}
+
+pub fn parse_bpb(boot: &[u8]) -> Result<Bpb, &'static str> {
+    if boot.len() < 512 { return Err("short boot sector") }
+    let bps = u16::from_le_bytes([boot[11], boot[12]])
+    let spc = boot[13]
+    let reserved = u16::from_le_bytes([boot[14], boot[15]])
+    let fat_count = boot[16]
+    let total = u32::from_le_bytes([boot[32], boot[33], boot[34], boot[35]])
+    let fatsz = u32::from_le_bytes([boot[36], boot[37], boot[38], boot[39]])
+    let root_cluster = u32::from_le_bytes([boot[44], boot[45], boot[46], boot[47]])
+    let fat_start = reserved as u32
+    let data_start = fat_start + fat_count as u32 * fatsz
+    Ok(Bpb {
+        bytes_per_sector: bps, sectors_per_cluster: spc,
+        reserved_sectors: reserved, fat_count, total_sectors: total,
+        sectors_per_fat: fatsz, root_cluster,
+        fat_start_sector: fat_start, data_start_sector: data_start,
+    })
+}
+
+pub fn cluster_to_sector(bpb: &Bpb, cluster: u32) -> u32 {
+    bpb.data_start_sector + (cluster - 2) * bpb.sectors_per_cluster as u32
+}
+
+pub fn walk_chain(fat: &[u8], first: u32) -> Vec<u32> {
+    let mut out = Vec::new(); let mut c = first
+    loop {
+        out.push(c)
+        let offset = (c as usize) * 4
+        if offset + 4 > fat.len() { break }
+        let next = u32::from_le_bytes([fat[offset], fat[offset+1], fat[offset+2], fat[offset+3]])
+            & 0x0FFF_FFFF
+        if next >= 0x0FFF_FFF8 || next < 2 { break }
+        c = next
+    }
+    out
+}
