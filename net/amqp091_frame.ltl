@@ -1,0 +1,49 @@
+// stdlib/net/amqp091_frame.ltl — AMQP 0.9.1 frame codec.
+//
+// Classic RabbitMQ protocol. A frame is:
+//   [type(1)][channel(2)][payload_size(4)][payload ...][0xCE]
+// Frame types: METHOD(1), HEADER(2), BODY(3), HEARTBEAT(8). Method
+// frames further break into (class_id, method_id, arguments) where
+// arguments use a compact short-string / long-string / field-table
+// encoding. We decode types and classify METHOD frames for routing.
+
+pub enum FrameType { Method = 1, Header = 2, Body = 3, Heartbeat = 8 }
+pub const FRAME_END: u8 = 0xCE
+
+pub struct Frame<'a> { pub type_: u8, pub channel: u16, pub payload: &'a [u8] }
+
+pub fn decode(bytes: &[u8]) -> Result<(Frame, usize), &'static str> {
+    if bytes.len() < 8 { return Err("short frame") }
+    let type_ = bytes[0]
+    let channel = u16::from_be_bytes([bytes[1], bytes[2]])
+    let size = u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]) as usize
+    if bytes.len() < 7 + size + 1 { return Err("truncated") }
+    if bytes[7 + size] != FRAME_END { return Err("missing frame-end marker") }
+    Ok((Frame { type_, channel, payload: &bytes[7..7 + size] }, 8 + size))
+}
+
+pub fn parse_method(payload: &[u8]) -> Result<(u16, u16, &[u8]), &'static str> {
+    if payload.len() < 4 { return Err("short method frame") }
+    let class_id = u16::from_be_bytes([payload[0], payload[1]])
+    let method_id = u16::from_be_bytes([payload[2], payload[3]])
+    Ok((class_id, method_id, &payload[4..]))
+}
+
+pub fn method_name(class_id: u16, method_id: u16) -> &'static str {
+    match (class_id, method_id) {
+        (10, 10) => "connection.start", (10, 11) => "connection.start-ok",
+        (10, 40) => "connection.open",  (10, 41) => "connection.open-ok",
+        (20, 10) => "channel.open",     (20, 11) => "channel.open-ok",
+        (40, 10) => "exchange.declare",
+        (50, 10) => "queue.declare",    (50, 20) => "queue.bind",
+        (60, 40) => "basic.publish",    (60, 60) => "basic.deliver",
+        (60, 20) => "basic.consume",
+        _ => "unknown",
+    }
+}
+
+pub fn read_short_string(bytes: &[u8]) -> Result<(&str, usize), &'static str> {
+    let len = bytes[0] as usize
+    let s = std::str::from_utf8(&bytes[1..1 + len]).map_err(|_| "bad utf8")?
+    Ok((s, 1 + len))
+}
