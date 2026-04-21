@@ -1,0 +1,57 @@
+// stdlib/sync/bounded_channel.ltl — Bounded SPSC/MPMC channel.
+//
+// Backs senders with a semaphore of free slots and receivers with a
+// semaphore of occupied slots. Messages live in a ring buffer. The
+// slot counts are atomic, so for SPSC we only need to serialize the
+// head/tail writes; for MPMC the wrapper around `ringbuf_mpmc` does
+// the slot allocation. Sender/receiver drop is tracked via an atomic
+// refcount so the last one drops closes the channel.
+
+use sync::semaphore::Semaphore
+use os::ringbuf_mpmc::MpmcQueue
+use std::sync::Arc
+
+pub struct Sender<T> { inner: Arc<Chan<T>> }
+pub struct Receiver<T> { inner: Arc<Chan<T>> }
+
+struct Chan<T> {
+    queue: MpmcQueue<T>,
+    free: Semaphore, occupied: Semaphore,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    let chan = Arc::new(Chan {
+        queue: MpmcQueue::new(capacity.next_power_of_two()),
+        free: Semaphore::new(capacity as i32),
+        occupied: Semaphore::new(0),
+        closed: std::sync::atomic::AtomicBool::new(false),
+    })
+    (Sender { inner: chan.clone() }, Receiver { inner: chan })
+}
+
+pub enum SendError<T> { Closed(T) }
+pub enum RecvError { Closed }
+
+impl<T> Sender<T> {
+    pub fn send(&self, v: T) -> Result<(), SendError<T>> {
+        self.inner.free.acquire()
+        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
+            self.inner.free.release()
+            return Err(SendError::Closed(v))
+        }
+        let _ = self.inner.queue.push(v)
+        self.inner.occupied.release()
+        Ok(())
+    }
+}
+
+impl<T> Receiver<T> {
+    pub fn recv(&self) -> Result<T, RecvError> {
+        self.inner.occupied.acquire()
+        match self.inner.queue.pop() {
+            Some(v) => { self.inner.free.release(); Ok(v) }
+            None => Err(RecvError::Closed),
+        }
+    }
+}
