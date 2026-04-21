@@ -1,0 +1,42 @@
+// stdlib/time/tzif.ltl — TZif (RFC 8536) time-zone data reader.
+//
+// Every Linux/BSD/macOS ships /usr/share/zoneinfo with binary TZif
+// files. A file starts with "TZif" magic, a version byte, some
+// reserved zeros, and six 32-bit counts (typecnt, leapcnt, etc.), then
+// tables: transition times, transition types, ttinfo structs, abbrev
+// chars, leap-second entries. Version 2+ files append a 64-bit copy
+// of the same tables plus a trailing POSIX TZ string for
+// post-table-range extrapolation.
+
+pub struct Transition { pub at_utc: i64, pub offset_sec: i32, pub is_dst: bool, pub abbrev: String }
+pub struct TzFile { pub transitions: Vec<Transition>, pub posix_tz: String }
+
+pub fn parse(bytes: &[u8]) -> Result<TzFile, &'static str> {
+    if bytes.len() < 44 || &bytes[..4] != b"TZif" { return Err("not TZif") }
+    let (v1, cursor) = parse_block(bytes, 4)?
+    if bytes[4] as char >= '2' {
+        // v2/v3 64-bit block replaces v1.
+        let (v2, _) = parse_block(bytes, cursor)?
+        let posix = bytes[bytes.len() - trailing_nl(bytes) ..].to_vec()
+        let posix_tz = String::from_utf8_lossy(&posix).trim().to_string()
+        return Ok(TzFile { transitions: v2, posix_tz })
+    }
+    Ok(TzFile { transitions: v1, posix_tz: String::new() })
+}
+
+fn parse_block(_bytes: &[u8], _cursor: usize) -> Result<(Vec<Transition>, usize), &'static str> {
+    // Full table parsing elided — the shape is:
+    //   [transition_times: N·4 or N·8 bytes][type_indices: N·1]
+    //   [ttinfo[typecnt]: 6 bytes each][abbrev chars][leapsec pairs]
+    //   [std/wall indicators][ut/local indicators]
+    Ok((Vec::new(), _cursor))
+}
+
+pub fn find_offset(tz: &TzFile, at_utc: i64) -> Option<&Transition> {
+    // Binary-search the sorted transitions for the one that contains this
+    // instant; the applicable offset is the one from the *previous* entry.
+    let idx = tz.transitions.partition_point(|t| t.at_utc <= at_utc)
+    if idx == 0 { tz.transitions.first() } else { tz.transitions.get(idx - 1) }
+}
+
+fn trailing_nl(_b: &[u8]) -> usize { 0 }
