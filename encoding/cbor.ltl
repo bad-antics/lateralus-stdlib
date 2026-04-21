@@ -1,18 +1,26 @@
 // stdlib/encoding/cbor.ltl — CBOR (RFC 8949) encoder/decoder.
 //
-// Concise Binary Object Representation — JSON-ish shape, binary on the
-// wire. Each value is a 1-byte initial with major type (top 3 bits)
-// and argument (bottom 5 bits: 0-23 literal, 24=1byte, 25=2, 26=4,
-// 27=8, 31=indefinite-length marker). Major types:
-//   0 uint, 1 -uint, 2 bytes, 3 text, 4 array, 5 map, 6 tag, 7 float/null/bool
-// Used by COSE, CTAP (FIDO2), CDDL, and the IoT world because a
-// typical JSON payload shrinks ~40% while round-tripping losslessly.
+// Concise Binary Object Representation — JSON-ish shape, binary wire.
+// Each value starts with a 1-byte head: major type (top 3 bits) and
+// argument info (bottom 5 bits). Argument info 0-23 encodes its value
+// directly, 24/25/26/27 mean the next 1/2/4/8 BE bytes hold the
+// argument, and 31 marks an indefinite-length collection terminated
+// by a 0xFF break byte. Major types:
+//   0 uint       1 -1-uint    2 byte string   3 text string
+//   4 array      5 map        6 tag           7 float/simple
+// CBOR is the wire format for COSE, CTAP2 (FIDO2), and large parts of
+// the IoT ecosystem.
 
 pub enum Value {
     Uint(u64), NegInt(u64), Bytes(Vec<u8>), Text(String),
     Array(Vec<Value>), Map(Vec<(Value, Value)>),
-    Tag(u64, Box<Value>), Bool(bool), Null, Undefined, F32(f32), F64(f64),
+    Tag(u64, Box<Value>), Bool(bool), Null, Undefined,
+    F16(u16), F32(f32), F64(f64), Simple(u8),
 }
+
+const BREAK: u8 = 0xFF
+
+// ─────────────────────────── Encode ──────────────────────────────────
 
 pub fn encode(v: &Value, out: &mut Vec<u8>) {
     match v {
@@ -30,53 +38,187 @@ pub fn encode(v: &Value, out: &mut Vec<u8>) {
         Value::Bool(true)  => out.push(0xF5),
         Value::Null        => out.push(0xF6),
         Value::Undefined   => out.push(0xF7),
+        Value::F16(bits)   => { out.push(0xF9); out.extend_from_slice(&bits.to_be_bytes()) }
         Value::F32(f)      => { out.push(0xFA); out.extend_from_slice(&f.to_be_bytes()) }
         Value::F64(f)      => { out.push(0xFB); out.extend_from_slice(&f.to_be_bytes()) }
+        Value::Simple(n)   => {
+            // Simple values 0-19 are literal; 32-255 use the one-byte form.
+            if *n < 24 { out.push(0xE0 | n) } else { out.push(0xF8); out.push(*n) }
+        }
     }
 }
 
 fn encode_head(major: u8, arg: u64, out: &mut Vec<u8>) {
     let m = major << 5
-    if arg <= 23 { out.push(m | arg as u8) }
-    else if arg <= 0xFF { out.push(m | 24); out.push(arg as u8) }
-    else if arg <= 0xFFFF {
-        out.push(m | 25); out.extend_from_slice(&(arg as u16).to_be_bytes())
-    } else if arg <= 0xFFFF_FFFF {
-        out.push(m | 26); out.extend_from_slice(&(arg as u32).to_be_bytes())
-    } else {
-        out.push(m | 27); out.extend_from_slice(&arg.to_be_bytes())
-    }
+    if arg <= 23            { out.push(m | arg as u8) }
+    else if arg <= 0xFF     { out.push(m | 24); out.push(arg as u8) }
+    else if arg <= 0xFFFF   { out.push(m | 25); out.extend_from_slice(&(arg as u16).to_be_bytes()) }
+    else if arg <= 0xFFFF_FFFF { out.push(m | 26); out.extend_from_slice(&(arg as u32).to_be_bytes()) }
+    else                    { out.push(m | 27); out.extend_from_slice(&arg.to_be_bytes()) }
 }
 
+// ─────────────────────────── Decode ──────────────────────────────────
+
 pub fn decode(bytes: &[u8]) -> Result<(Value, usize), &'static str> {
-    if bytes.is_empty() { return Err("empty") }
-    let initial = bytes[0]
-    let major = initial >> 5; let info = initial & 0x1F
-    let (arg, n) = read_arg(info, &bytes[1..])?
-    let consumed = 1 + n
+    decode_at(bytes, 0)
+}
+
+fn decode_at(bytes: &[u8], start: usize) -> Result<(Value, usize), &'static str> {
+    if start >= bytes.len() { return Err("unexpected eof") }
+    let initial = bytes[start]
+    let major = initial >> 5
+    let info  = initial & 0x1F
+    let mut p = start + 1
+
+    // Indefinite-length collections (major 2/3/4/5) use info == 31.
+    let indefinite = info == 31
+
+    let arg_len = if indefinite { 0u64 } else {
+        let (a, n) = read_arg(info, &bytes[p..])?
+        p += n
+        a
+    }
+
     match major {
-        0 => Ok((Value::Uint(arg), consumed)),
-        1 => Ok((Value::NegInt(arg), consumed)),
+        0 => Ok((Value::Uint(arg_len), p - start)),
+        1 => Ok((Value::NegInt(arg_len), p - start)),
         2 => {
-            let b = bytes[consumed..consumed + arg as usize].to_vec()
-            Ok((Value::Bytes(b), consumed + arg as usize))
+            if indefinite {
+                // Concatenate definite-length byte-string chunks until BREAK.
+                let mut buf = Vec::new()
+                loop {
+                    if p >= bytes.len() { return Err("unterminated bytes*") }
+                    if bytes[p] == BREAK { p += 1; break }
+                    let (chunk, n) = decode_at(bytes, p)?
+                    p += n
+                    match chunk {
+                        Value::Bytes(b) => buf.extend_from_slice(&b),
+                        _ => return Err("non-bytes chunk in bytes*"),
+                    }
+                }
+                Ok((Value::Bytes(buf), p - start))
+            } else {
+                let end = p + arg_len as usize
+                if end > bytes.len() { return Err("truncated bytes") }
+                let b = bytes[p..end].to_vec()
+                Ok((Value::Bytes(b), end - start))
+            }
         }
         3 => {
-            let s = std::str::from_utf8(&bytes[consumed..consumed + arg as usize])
-                .map_err(|_| "bad utf8")?.to_string()
-            Ok((Value::Text(s), consumed + arg as usize))
+            if indefinite {
+                let mut s = String::new()
+                loop {
+                    if p >= bytes.len() { return Err("unterminated text*") }
+                    if bytes[p] == BREAK { p += 1; break }
+                    let (chunk, n) = decode_at(bytes, p)?
+                    p += n
+                    match chunk {
+                        Value::Text(t) => s.push_str(&t),
+                        _ => return Err("non-text chunk in text*"),
+                    }
+                }
+                Ok((Value::Text(s), p - start))
+            } else {
+                let end = p + arg_len as usize
+                if end > bytes.len() { return Err("truncated text") }
+                let s = std::str::from_utf8(&bytes[p..end]).map_err(|_| "bad utf8")?.to_string()
+                Ok((Value::Text(s), end - start))
+            }
         }
-        _ => Err("unsupported major type in minimal decoder"),
+        4 => {
+            let mut items = Vec::new()
+            if indefinite {
+                loop {
+                    if p >= bytes.len() { return Err("unterminated array*") }
+                    if bytes[p] == BREAK { p += 1; break }
+                    let (v, n) = decode_at(bytes, p)?; p += n
+                    items.push(v)
+                }
+            } else {
+                for _ in 0..arg_len {
+                    let (v, n) = decode_at(bytes, p)?; p += n
+                    items.push(v)
+                }
+            }
+            Ok((Value::Array(items), p - start))
+        }
+        5 => {
+            let mut pairs = Vec::new()
+            if indefinite {
+                loop {
+                    if p >= bytes.len() { return Err("unterminated map*") }
+                    if bytes[p] == BREAK { p += 1; break }
+                    let (k, n1) = decode_at(bytes, p)?; p += n1
+                    let (v, n2) = decode_at(bytes, p)?; p += n2
+                    pairs.push((k, v))
+                }
+            } else {
+                for _ in 0..arg_len {
+                    let (k, n1) = decode_at(bytes, p)?; p += n1
+                    let (v, n2) = decode_at(bytes, p)?; p += n2
+                    pairs.push((k, v))
+                }
+            }
+            Ok((Value::Map(pairs), p - start))
+        }
+        6 => {
+            let (inner, n) = decode_at(bytes, p)?
+            Ok((Value::Tag(arg_len, Box::new(inner)), (p - start) + n))
+        }
+        7 => {
+            // Simple / float / break. `info` drives the shape.
+            match info {
+                0..=19 => Ok((Value::Simple(info), p - start)),
+                20 => Ok((Value::Bool(false), p - start)),
+                21 => Ok((Value::Bool(true), p - start)),
+                22 => Ok((Value::Null, p - start)),
+                23 => Ok((Value::Undefined, p - start)),
+                24 => Ok((Value::Simple(arg_len as u8), p - start)),
+                25 => Ok((Value::F16(arg_len as u16), p - start)),
+                26 => Ok((Value::F32(f32::from_bits(arg_len as u32)), p - start)),
+                27 => Ok((Value::F64(f64::from_bits(arg_len)), p - start)),
+                31 => Err("unexpected break"),
+                _  => Err("reserved simple"),
+            }
+        }
+        _ => Err("unreachable major"),
     }
 }
 
 fn read_arg(info: u8, rest: &[u8]) -> Result<(u64, usize), &'static str> {
     match info {
         0..=23 => Ok((info as u64, 0)),
-        24 => Ok((rest[0] as u64, 1)),
-        25 => Ok((u16::from_be_bytes([rest[0], rest[1]]) as u64, 2)),
-        26 => Ok((u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as u64, 4)),
-        27 => Ok((u64::from_be_bytes(rest[..8].try_into().unwrap()), 8)),
-        _  => Err("reserved or indefinite-length not supported here"),
+        24 => { if rest.is_empty() { return Err("short arg") }
+                Ok((rest[0] as u64, 1)) }
+        25 => { if rest.len() < 2 { return Err("short arg") }
+                Ok((u16::from_be_bytes([rest[0], rest[1]]) as u64, 2)) }
+        26 => { if rest.len() < 4 { return Err("short arg") }
+                Ok((u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as u64, 4)) }
+        27 => { if rest.len() < 8 { return Err("short arg") }
+                Ok((u64::from_be_bytes(rest[..8].try_into().unwrap()), 8)) }
+        28..=30 => Err("reserved info"),
+        31 => Err("indefinite handled by caller"),
+        _  => Err("unreachable info"),
     }
+}
+
+// Convert a CBOR half-float (f16) bit pattern to f32 — IEEE 754 binary16.
+pub fn half_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32
+    let exp  = ((h >> 10) & 0x1F) as u32
+    let mant = (h & 0x3FF) as u32
+    let bits = if exp == 0 {
+        if mant == 0 { sign << 31 } else {
+            // Subnormal: renormalize.
+            let mut m = mant; let mut e = 1i32
+            while (m & 0x400) == 0 { m <<= 1; e -= 1 }
+            m &= 0x3FF
+            (sign << 31) | (((127 - 15 + e) as u32) << 23) | (m << 13)
+        }
+    } else if exp == 0x1F {
+        (sign << 31) | 0x7F80_0000 | (mant << 13) // Inf/NaN
+    } else {
+        (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
+    }
+    f32::from_bits(bits)
 }
