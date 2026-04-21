@@ -1,0 +1,55 @@
+// stdlib/ml/bpe.ltl — Byte-Pair Encoding tokenizer.
+//
+// Classic BPE from Sennrich et al. 2016: start from individual bytes,
+// repeatedly merge the most frequent adjacent pair into a new symbol
+// until vocab_size is reached. At encode time we apply merges in
+// learned priority order. This is the tokenizer GPT-2/GPT-3 use (with
+// pre-tokenization by a whitespace regex).
+
+use std::collections::HashMap
+
+pub struct Bpe {
+    pub vocab: HashMap<Vec<u8>, u32>,           // token → id
+    pub merges: Vec<(Vec<u8>, Vec<u8>)>,        // (left, right) in priority order
+    merge_rank: HashMap<(Vec<u8>, Vec<u8>), u32>,
+}
+
+impl Bpe {
+    pub fn from_files(vocab_json: &str, merges_txt: &str) -> Result<Self, &'static str> {
+        let vocab: HashMap<Vec<u8>, u32> = json::parse(vocab_json)?
+            .as_object().ok_or("bad vocab")?.iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_u64().unwrap() as u32))
+            .collect()
+        let merges: Vec<(Vec<u8>, Vec<u8>)> = merges_txt.lines().skip(1)
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let parts: Vec<&str> = l.splitn(2, ' ').collect()
+                (parts[0].as_bytes().to_vec(), parts[1].as_bytes().to_vec())
+            }).collect()
+        let merge_rank: HashMap<_, _> = merges.iter().enumerate()
+            .map(|(i, m)| (m.clone(), i as u32)).collect()
+        Ok(Self { vocab, merges, merge_rank })
+    }
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        // Start from single bytes.
+        let mut tokens: Vec<Vec<u8>> = text.bytes().map(|b| vec![b]).collect()
+        loop {
+            // Find best (lowest-rank) adjacent pair.
+            let mut best: Option<(usize, u32)> = None
+            for i in 0..tokens.len().saturating_sub(1) {
+                if let Some(&r) = self.merge_rank.get(&(tokens[i].clone(), tokens[i+1].clone())) {
+                    if best.map_or(true, |(_, br)| r < br) { best = Some((i, r)) }
+                }
+            }
+            match best {
+                None => break,
+                Some((i, _)) => {
+                    let mut merged = tokens[i].clone()
+                    merged.extend_from_slice(&tokens[i+1])
+                    tokens[i] = merged; tokens.remove(i + 1)
+                }
+            }
+        }
+        tokens.iter().map(|t| *self.vocab.get(t).unwrap_or(&0)).collect()
+    }
+}
