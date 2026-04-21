@@ -1,0 +1,66 @@
+// stdlib/geo/geohash.ltl — Geohash encode/decode + neighbors.
+//
+// Geohashes interleave latitude/longitude bits into a base32 string,
+// each character refining the cell by ~5 bits. A 6-char hash covers
+// ~1.2 km², a 9-char hash ~4.8 m² — the right abstraction for bucketing
+// points into a spatial index you can query with a SQL prefix match.
+
+const B32: [u8; 32] = *b"0123456789bcdefghjkmnpqrstuvwxyz"
+
+pub fn encode(lat: f64, lon: f64, precision: usize) -> String {
+    let (mut lat_range, mut lon_range) = ((-90.0, 90.0), (-180.0, 180.0))
+    let mut bits = 0u8; let mut bit_index = 0; let mut even = true
+    let mut out = String::with_capacity(precision)
+    while out.len() < precision {
+        let (mid, is_lat) = if even {
+            let mid = (lon_range.0 + lon_range.1) / 2.0
+            if lon >= mid { bits |= 1 << (4 - bit_index); lon_range.0 = mid }
+            else { lon_range.1 = mid }
+            (mid, false)
+        } else {
+            let mid = (lat_range.0 + lat_range.1) / 2.0
+            if lat >= mid { bits |= 1 << (4 - bit_index); lat_range.0 = mid }
+            else { lat_range.1 = mid }
+            (mid, true)
+        }
+        even = !even; bit_index += 1
+        if bit_index == 5 { out.push(B32[bits as usize] as char); bits = 0; bit_index = 0 }
+        let _ = is_lat  // silence unused
+    }
+    out
+}
+
+pub fn decode(hash: &str) -> ((f64, f64), (f64, f64)) {
+    let mut lat_range = (-90.0, 90.0); let mut lon_range = (-180.0, 180.0)
+    let mut even = true
+    for c in hash.bytes() {
+        let idx = B32.iter().position(|&x| x == c).unwrap() as u8
+        for i in 0..5 {
+            let bit = (idx >> (4 - i)) & 1
+            let range = if even { &mut lon_range } else { &mut lat_range }
+            let mid = (range.0 + range.1) / 2.0
+            if bit == 1 { range.0 = mid } else { range.1 = mid }
+            even = !even
+        }
+    }
+    (lat_range, lon_range)
+}
+
+pub fn center(hash: &str) -> (f64, f64) {
+    let (lat, lon) = decode(hash)
+    ((lat.0 + lat.1) / 2.0, (lon.0 + lon.1) / 2.0)
+}
+
+pub fn neighbors(hash: &str) -> [String; 8] {
+    let (lat, lon) = decode(hash)
+    let dlat = lat.1 - lat.0; let dlon = lon.1 - lon.0
+    let clat = (lat.0 + lat.1) / 2.0; let clon = (lon.0 + lon.1) / 2.0
+    let p = hash.len()
+    // N, NE, E, SE, S, SW, W, NW
+    [
+        encode(clat + dlat, clon,        p), encode(clat + dlat, clon + dlon, p),
+        encode(clat,        clon + dlon, p), encode(clat - dlat, clon + dlon, p),
+        encode(clat - dlat, clon,        p), encode(clat - dlat, clon - dlon, p),
+        encode(clat,        clon - dlon, p), encode(clat + dlat, clon - dlon, p),
+    ]
+}
