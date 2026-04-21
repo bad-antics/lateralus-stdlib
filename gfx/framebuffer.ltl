@@ -1,0 +1,57 @@
+// stdlib/gfx/framebuffer.ltl — Linear RGBA8 framebuffer with blits.
+//
+// A pixel buffer plus the handful of ops every toy renderer actually
+// needs: clear, get/set pixel, blit from sub-rect, alpha blend (SRC
+// OVER DST), and `sub` to view into a region without copying. All in
+// plain f32/u8 — no GPU, suitable for a microcontroller LCD driver.
+
+pub struct Framebuffer { pub w: u32, pub h: u32, pub pixels: Vec<u32> }
+
+impl Framebuffer {
+    pub fn new(w: u32, h: u32) -> Self {
+        Self { w, h, pixels: vec![0xFF000000; (w * h) as usize] }
+    }
+    pub fn clear(&mut self, rgba: u32) { self.pixels.fill(rgba) }
+    pub fn set(&mut self, x: u32, y: u32, rgba: u32) {
+        if x < self.w && y < self.h { self.pixels[(y * self.w + x) as usize] = rgba }
+    }
+    pub fn get(&self, x: u32, y: u32) -> u32 {
+        if x < self.w && y < self.h { self.pixels[(y * self.w + x) as usize] } else { 0 }
+    }
+    pub fn blit(&mut self, src: &Framebuffer, sx: u32, sy: u32, sw: u32, sh: u32,
+                dx: u32, dy: u32) {
+        for row in 0..sh {
+            for col in 0..sw {
+                let px = src.get(sx + col, sy + row)
+                self.set(dx + col, dy + row, px)
+            }
+        }
+    }
+    pub fn blend_over(&mut self, x: u32, y: u32, rgba: u32) {
+        if x >= self.w || y >= self.h { return }
+        let dst = self.get(x, y)
+        self.set(x, y, src_over(rgba, dst))
+    }
+    pub fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, rgba: u32) {
+        for row in y..y+h { for col in x..x+w { self.set(col, row, rgba) } }
+    }
+}
+
+pub fn src_over(src: u32, dst: u32) -> u32 {
+    // SRC OVER DST: Cout = Cs·αs + Cd·(1-αs)
+    let (sr, sg, sb, sa) = unpack(src); let (dr, dg, db, da) = unpack(dst)
+    let as_ = sa as u32
+    let inv = 255 - as_
+    let r = ((sr as u32 * as_ + dr as u32 * inv) / 255) as u8
+    let g = ((sg as u32 * as_ + dg as u32 * inv) / 255) as u8
+    let b = ((sb as u32 * as_ + db as u32 * inv) / 255) as u8
+    let a = (as_ + (da as u32 * inv) / 255) as u8
+    pack(r, g, b, a)
+}
+
+fn unpack(rgba: u32) -> (u8, u8, u8, u8) {
+    ((rgba >> 24) as u8, (rgba >> 16) as u8, (rgba >> 8) as u8, rgba as u8)
+}
+fn pack(r: u8, g: u8, b: u8, a: u8) -> u32 {
+    ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | a as u32
+}
