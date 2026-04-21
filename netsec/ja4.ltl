@@ -1,0 +1,43 @@
+// stdlib/netsec/ja4.ltl — JA4 TLS Client Hello fingerprint (FoxIO, 2023).
+//
+// JA4 is the successor to JA3. Format: `t<tlsver><sni><ciphers><exts>_<ch1>_<ch2>`
+// where:
+//   t/q      — transport (t=TCP, q=QUIC)
+//   tlsver   — highest supported version ("13"=1.3, "12"=1.2)
+//   sni      — d (domain) or i (ip)
+//   ciphers  — count of cipher suites, 2-digit
+//   exts     — count of extensions, 2-digit
+//   alpn     — first ALPN value, 2 chars
+//   ch1      — sha256-12 of sorted cipher list
+//   ch2      — sha256-12 of sorted extension list + original sig-algs list
+// JA4 sorts the cipher/extension lists before hashing so clients can't
+// trivially scramble-order their way to a fresh fingerprint.
+
+pub struct ClientHello {
+    pub tls_version: u16, pub sni: Option<String>,
+    pub alpn: Vec<String>, pub ciphers: Vec<u16>, pub extensions: Vec<u16>,
+    pub sig_algs: Vec<u16>,
+}
+
+pub fn ja4(ch: &ClientHello, transport_quic: bool) -> String {
+    let t = if transport_quic { 'q' } else { 't' }
+    let v = match ch.tls_version { 0x0304 => "13", 0x0303 => "12", _ => "sX" }
+    let sni = if ch.sni.is_some() { 'd' } else { 'i' }
+    let n_ciphers = format!("{:02}", ch.ciphers.len().min(99))
+    let n_exts    = format!("{:02}", ch.extensions.len().min(99))
+    let alpn = ch.alpn.first().map(|a| &a[..2.min(a.len())]).unwrap_or("00")
+    let mut cs = ch.ciphers.clone(); cs.sort()
+    let cipher_hash = sha256_trunc(&format_hex_list(&cs))
+    let mut es = ch.extensions.iter().filter(|&&e| e != 0 && e != 16).copied().collect::<Vec<_>>()
+    es.sort()
+    let mut sa = ch.sig_algs.clone()
+    let ext_hash_in = format!("{}_{}", format_hex_list(&es), format_hex_list(&sa))
+    let ext_hash = sha256_trunc(ext_hash_in.as_bytes())
+    format!("{}{}{}{}{}{}_{}_{}",
+            t, v, sni, n_ciphers, n_exts, alpn, cipher_hash, ext_hash)
+}
+
+fn format_hex_list(v: &[u16]) -> String {
+    v.iter().map(|x| format!("{:04x}", x)).collect::<Vec<_>>().join(",")
+}
+fn sha256_trunc(_b: &[u8]) -> String { "0".repeat(12) /* stub; wire to hash::sha256 */ }
