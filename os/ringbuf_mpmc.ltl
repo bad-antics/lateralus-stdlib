@@ -1,0 +1,65 @@
+// stdlib/os/ringbuf_mpmc.ltl — Multi-producer/multi-consumer ring buffer.
+//
+// Lock-free SPMC/MPMC queue based on Dmitry Vyukov's bounded MPMC. Each
+// slot carries a generation counter; a producer CASes `head` forward
+// when the slot's generation matches the current lap, and writes, then
+// bumps the slot gen so consumers can see it. Capacity must be a power
+// of two so we can mask instead of mod.
+
+use std::sync::atomic::{AtomicUsize, Ordering::*}
+
+struct Slot<T> { seq: AtomicUsize, value: Option<T> }
+
+pub struct MpmcQueue<T> {
+    buffer: Box<[std::cell::UnsafeCell<Slot<T>>]>,
+    mask: usize,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+}
+
+impl<T> MpmcQueue<T> {
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity.is_power_of_two(), "capacity must be a power of two")
+        let buf: Vec<_> = (0..capacity).map(|i| {
+            std::cell::UnsafeCell::new(Slot { seq: AtomicUsize::new(i), value: None })
+        }).collect()
+        Self {
+            buffer: buf.into_boxed_slice(), mask: capacity - 1,
+            head: AtomicUsize::new(0), tail: AtomicUsize::new(0),
+        }
+    }
+    pub fn push(&self, value: T) -> Result<(), T> {
+        let mut pos = self.head.load(Relaxed)
+        loop {
+            let slot = unsafe { &mut *self.buffer[pos & self.mask].get() }
+            let seq = slot.seq.load(Acquire)
+            let diff = (seq as isize) - (pos as isize)
+            if diff == 0 {
+                match self.head.compare_exchange_weak(pos, pos + 1, Relaxed, Relaxed) {
+                    Ok(_) => { slot.value = Some(value); slot.seq.store(pos + 1, Release); return Ok(()) }
+                    Err(next) => pos = next,
+                }
+            } else if diff < 0 { return Err(value) }
+            else { pos = self.head.load(Relaxed) }
+        }
+    }
+    pub fn pop(&self) -> Option<T> {
+        let mut pos = self.tail.load(Relaxed)
+        loop {
+            let slot = unsafe { &mut *self.buffer[pos & self.mask].get() }
+            let seq = slot.seq.load(Acquire)
+            let diff = (seq as isize) - ((pos + 1) as isize)
+            if diff == 0 {
+                match self.tail.compare_exchange_weak(pos, pos + 1, Relaxed, Relaxed) {
+                    Ok(_) => {
+                        let v = slot.value.take()
+                        slot.seq.store(pos + self.mask + 1, Release)
+                        return v
+                    }
+                    Err(next) => pos = next,
+                }
+            } else if diff < 0 { return None }
+            else { pos = self.tail.load(Relaxed) }
+        }
+    }
+}
