@@ -1,0 +1,44 @@
+// stdlib/sync/barrier.ltl — Cyclic barrier with generation counter.
+//
+// Each thread calling `wait()` blocks until N threads have arrived.
+// Once the count is reached the barrier "trips" and all threads are
+// released, and the barrier resets for the next round. Generation
+// counter avoids the race where a slow thread from round R+1 wakes up
+// waiters from round R before they've left.
+
+use std::sync::Mutex
+use std::sync::Condvar
+
+pub struct Barrier {
+    n: u32,
+    state: Mutex<State>,
+    cv: Condvar,
+}
+
+struct State { waiting: u32, generation: u64 }
+
+pub struct Wait { pub is_leader: bool, pub generation: u64 }
+
+impl Barrier {
+    pub fn new(n: u32) -> Self {
+        assert!(n > 0)
+        Self { n, state: Mutex::new(State { waiting: 0, generation: 0 }), cv: Condvar::new() }
+    }
+    pub fn wait(&self) -> Wait {
+        let mut s = self.state.lock()
+        let gen = s.generation
+        s.waiting += 1
+        if s.waiting == self.n {
+            // Last arrival: trip the barrier.
+            s.generation += 1
+            s.waiting = 0
+            self.cv.notify_all()
+            Wait { is_leader: true, generation: gen }
+        } else {
+            while s.generation == gen {
+                s = self.cv.wait(s)
+            }
+            Wait { is_leader: false, generation: gen }
+        }
+    }
+}
