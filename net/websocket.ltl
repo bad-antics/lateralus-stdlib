@@ -1,0 +1,58 @@
+// stdlib/net/websocket.ltl — WebSocket (RFC 6455) frame codec.
+//
+// Fragmentation, masking, and payload length all live in the first 2-14
+// bytes. Payload length encoding is clever:
+//   len=0..125  → literal
+//   len=126     → next 2 bytes big-endian
+//   len=127     → next 8 bytes big-endian (≤ 2^63)
+// Client→server frames MUST be masked with a 4-byte key XORed over the
+// payload. Server→client MUST NOT be masked. We enforce both.
+
+pub enum OpCode { Cont = 0, Text = 1, Binary = 2, Close = 8, Ping = 9, Pong = 10 }
+
+pub struct Frame { pub fin: bool, pub opcode: u8, pub payload: Vec<u8> }
+
+pub fn decode(bytes: &[u8]) -> Result<(Frame, usize), &'static str> {
+    if bytes.len() < 2 { return Err("short") }
+    let fin = bytes[0] & 0x80 != 0
+    let opcode = bytes[0] & 0x0F
+    let masked = bytes[1] & 0x80 != 0
+    let len7 = bytes[1] & 0x7F
+    let (payload_len, mut i) = match len7 {
+        0..=125 => (len7 as usize, 2),
+        126 => (u16::from_be_bytes([bytes[2], bytes[3]]) as usize, 4),
+        127 => (u64::from_be_bytes(bytes[2..10].try_into().unwrap()) as usize, 10),
+        _ => unreachable!(),
+    }
+    let mask = if masked {
+        let m = [bytes[i], bytes[i+1], bytes[i+2], bytes[i+3]]
+        i += 4; Some(m)
+    } else { None }
+    if bytes.len() < i + payload_len { return Err("truncated") }
+    let mut payload = bytes[i..i + payload_len].to_vec()
+    if let Some(m) = mask {
+        for (k, b) in payload.iter_mut().enumerate() { *b ^= m[k & 3] }
+    }
+    Ok((Frame { fin, opcode, payload }, i + payload_len))
+}
+
+pub fn encode(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(14 + payload.len())
+    out.push(0x80 | (opcode & 0x0F))  // FIN=1
+    let mask_bit = if mask.is_some() { 0x80u8 } else { 0 }
+    if payload.len() <= 125 { out.push(mask_bit | payload.len() as u8) }
+    else if payload.len() <= 0xFFFF {
+        out.push(mask_bit | 126)
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes())
+    } else {
+        out.push(mask_bit | 127)
+        out.extend_from_slice(&(payload.len() as u64).to_be_bytes())
+    }
+    if let Some(m) = mask {
+        out.extend_from_slice(&m)
+        for (i, b) in payload.iter().enumerate() { out.push(b ^ m[i & 3]) }
+    } else {
+        out.extend_from_slice(payload)
+    }
+    out
+}
