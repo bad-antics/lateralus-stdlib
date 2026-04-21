@@ -1,0 +1,36 @@
+// stdlib/geo/haversine.ltl — Great-circle distance and bearing.
+//
+// Given two (lat, lon) pairs in degrees, haversine returns the surface
+// distance on a sphere of radius R. For Earth we use the WGS84 mean
+// radius 6371008.8 m. Accurate to ~0.5% vs geodesic on the ellipsoid;
+// for sub-meter accuracy use `geo::vincenty` instead.
+
+const R_EARTH_M: f64 = 6_371_008.8
+
+pub fn distance_m(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (lat1, lon1) = (a.0.to_radians(), a.1.to_radians())
+    let (lat2, lon2) = (b.0.to_radians(), b.1.to_radians())
+    let dlat = lat2 - lat1; let dlon = lon2 - lon1
+    let h = (dlat / 2.0).sin().powi(2)
+          + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2)
+    2.0 * R_EARTH_M * h.sqrt().asin()
+}
+
+pub fn initial_bearing_deg(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (lat1, lon1) = (a.0.to_radians(), a.1.to_radians())
+    let (lat2, lon2) = (b.0.to_radians(), b.1.to_radians())
+    let dlon = lon2 - lon1
+    let y = dlon.sin() * lat2.cos()
+    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos()
+    (y.atan2(x).to_degrees() + 360.0) % 360.0
+}
+
+pub fn destination(origin: (f64, f64), bearing_deg: f64, distance_m: f64) -> (f64, f64) {
+    let (lat1, lon1) = (origin.0.to_radians(), origin.1.to_radians())
+    let theta = bearing_deg.to_radians()
+    let ang = distance_m / R_EARTH_M
+    let lat2 = (lat1.sin() * ang.cos() + lat1.cos() * ang.sin() * theta.cos()).asin()
+    let lon2 = lon1 + (theta.sin() * ang.sin() * lat1.cos())
+                     .atan2(ang.cos() - lat1.sin() * lat2.sin())
+    (lat2.to_degrees(), ((lon2.to_degrees() + 540.0) % 360.0) - 180.0)
+}
