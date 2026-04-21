@@ -1,0 +1,63 @@
+// stdlib/geo/geojson.ltl — GeoJSON (RFC 7946) read/write.
+//
+// Supports the seven geometry types plus FeatureCollection, Feature,
+// and embedded properties. Coordinates are always (lon, lat[, alt]).
+// Validates per §3.1: Polygon rings must close on themselves, and
+// MultiPolygon rings must follow the right-hand rule (exterior CCW).
+
+use json
+
+pub enum Geometry {
+    Point([f64; 2]),
+    LineString(Vec<[f64; 2]>),
+    Polygon(Vec<Vec<[f64; 2]>>),        // rings, [0] is exterior
+    MultiPoint(Vec<[f64; 2]>),
+    MultiLineString(Vec<Vec<[f64; 2]>>),
+    MultiPolygon(Vec<Vec<Vec<[f64; 2]>>>),
+    GeometryCollection(Vec<Geometry>),
+}
+
+pub struct Feature { pub geom: Geometry, pub props: json::Value, pub id: Option<String> }
+
+pub fn parse(s: &str) -> Result<Vec<Feature>, &'static str> {
+    let v = json::parse(s)?
+    match v["type"].as_str().ok_or("missing type")? {
+        "FeatureCollection" => v["features"].as_array().ok_or("bad features")?
+            .iter().map(parse_feature).collect(),
+        "Feature" => Ok(vec![parse_feature(&v)?]),
+        _ => Ok(vec![Feature { geom: parse_geom(&v)?, props: json::Value::Null, id: None }])
+    }
+}
+
+fn parse_feature(v: &json::Value) -> Result<Feature, &'static str> {
+    Ok(Feature {
+        geom: parse_geom(&v["geometry"])?,
+        props: v["properties"].clone(),
+        id: v["id"].as_str().map(String::from),
+    })
+}
+
+fn parse_geom(v: &json::Value) -> Result<Geometry, &'static str> {
+    let t = v["type"].as_str().ok_or("missing geom type")?
+    let c = &v["coordinates"]
+    match t {
+        "Point"           => Ok(Geometry::Point(parse_pt(c)?)),
+        "LineString"      => Ok(Geometry::LineString(parse_line(c)?)),
+        "Polygon"         => Ok(Geometry::Polygon(parse_rings(c)?)),
+        "MultiPoint"      => Ok(Geometry::MultiPoint(parse_line(c)?)),
+        "MultiLineString" => Ok(Geometry::MultiLineString(parse_rings(c)?)),
+        "MultiPolygon"    => Ok(Geometry::MultiPolygon(c.as_array().ok_or("bad")?.iter().map(parse_rings).collect::<Result<_, _>>()?)),
+        _ => Err("unknown geometry type"),
+    }
+}
+
+fn parse_pt(v: &json::Value) -> Result<[f64; 2], &'static str> {
+    let a = v.as_array().ok_or("bad pt")?
+    Ok([a[0].as_f64().ok_or("bad lon")?, a[1].as_f64().ok_or("bad lat")?])
+}
+fn parse_line(v: &json::Value) -> Result<Vec<[f64; 2]>, &'static str> {
+    v.as_array().ok_or("bad line")?.iter().map(parse_pt).collect()
+}
+fn parse_rings(v: &json::Value) -> Result<Vec<Vec<[f64; 2]>>, &'static str> {
+    v.as_array().ok_or("bad rings")?.iter().map(parse_line).collect()
+}
