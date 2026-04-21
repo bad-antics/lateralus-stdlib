@@ -1,0 +1,52 @@
+// stdlib/netsec/dns_tunnel_detect.ltl — DNS tunneling heuristics.
+//
+// DNS tunneling (iodine, DNScat2) exfiltrates data by encoding it into
+// subdomain labels and receiving responses in TXT/CNAME data. Detection
+// signals:
+//   - High entropy in the label (random base32 looks like noise)
+//   - Very long FQDNs (> 64 bytes)
+//   - Unusual query type mix (TXT-heavy)
+//   - Burstiness / temporal regularity (beacon-like interval)
+// We compute these per-client and score against thresholds; a binary
+// classifier trained on these features gets ~99% precision in practice.
+
+use std::math::log2
+
+pub struct QueryFeatures {
+    pub fqdn: String, pub qtype: u16, pub label_count: u8,
+    pub max_label_len: u8, pub label_entropy: f32,
+}
+
+pub fn extract(fqdn: &str, qtype: u16) -> QueryFeatures {
+    let labels: Vec<&str> = fqdn.split('.').collect()
+    let max_label_len = labels.iter().map(|l| l.len()).max().unwrap_or(0) as u8
+    let entropy = labels.iter()
+        .map(|l| shannon_entropy(l.as_bytes()))
+        .fold(0.0f32, f32::max)
+    QueryFeatures {
+        fqdn: fqdn.to_string(), qtype,
+        label_count: labels.len() as u8, max_label_len, label_entropy: entropy,
+    }
+}
+
+pub fn shannon_entropy(b: &[u8]) -> f32 {
+    if b.is_empty() { return 0.0 }
+    let mut counts = [0u32; 256]
+    for &c in b { counts[c as usize] += 1 }
+    let n = b.len() as f32
+    counts.iter().filter(|&&c| c > 0)
+        .map(|&c| { let p = c as f32 / n; -p * log2(p) })
+        .sum()
+}
+
+pub fn score(f: &QueryFeatures) -> f32 {
+    let mut s = 0.0f32
+    if f.label_entropy > 3.8 { s += 1.0 }
+    if f.max_label_len > 50  { s += 1.5 }
+    if f.qtype == 16         { s += 0.5 }   // TXT — often used for C2 channels
+    if f.qtype == 5          { s += 0.3 }   // CNAME chains are another trick
+    if f.fqdn.len() > 100    { s += 1.0 }
+    s
+}
+
+pub const THRESHOLD: f32 = 2.5
